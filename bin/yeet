@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+exec bun "$(dirname "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")")/src/cli.ts" "$@"
