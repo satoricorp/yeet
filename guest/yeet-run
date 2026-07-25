@@ -1,0 +1,158 @@
+#!/bin/bash
+#
+# yeet-run — one iteration, entirely inside the microVM.
+#
+# Staged into run state (NOT baked into the image) so iterating on it never means rebuilding
+# a 563 MB image.
+#
+# Contract, in one line: this script writes FACTS, the host writes JSON. Every value in
+# meta.kv matches ^[A-Za-z0-9._:/+=-]*$ — SHAs, integers, enum tokens. Free text goes in the
+# raw .log files. The guest has no jq and no python3, so hand-rolled JSON escaping over
+# arbitrary test output would be a guaranteed bug.
+#
+# The other invariant: **once DONE exists this script exits 0**, always. That makes any
+# nonzero launcher exit unambiguously an infrastructure failure, which is what lets the host
+# tell "the agent failed" (a result) from "the VM failed" (a retry).
+#
+# bash, not sh: /bin/sh is dash here, and this needs arrays and reliable pipefail.
+set -uo pipefail
+
+# YEET_DIR arrives via the launcher's --env (env values round-trip byte-exact; argv does not).
+# Everything else comes from the per-iteration request file, so no state is shared between
+# iterations via a fixed mutable path.
+: "${YEET_DIR:?YEET_DIR must be set by the launcher}"
+. "$YEET_DIR/request.env"
+
+# The provider key lives in an agent-level 0600 file inside a 0700 dir, sourced but never
+# echoed. It is deliberately not in request.env (which is per-iteration and gets read for
+# debugging), not in argv (world-readable via ps), and not baked into the image.
+[ -f /yeet/run.env ] && . /yeet/run.env
+
+D="$YEET_DIR"
+mkdir -p "$D"
+# The runner's own trace goes to its own file — never mixed into agent.log or test.log, which
+# are parsed and fed back to the model.
+exec 2>"$D/runner.log"
+set -x
+
+W="$YEET_WORKSPACE"
+cd "$W"
+
+meta() { printf '%s=%s\n' "$1" "$2" >> "$D/meta.kv.tmp"; }
+
+: > "$D/meta.kv.tmp"
+meta schema      "yeet.meta/1"
+meta runId       "$YEET_RUN_ID"
+meta iteration   "$YEET_ITER"
+meta phase       "$YEET_PHASE"
+meta startedAtEpoch "$(date +%s)"
+
+git config --global --add safe.directory '*' 2>/dev/null || true
+
+BEFORE_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
+BEFORE_TREE=$(git rev-parse 'HEAD^{tree}' 2>/dev/null || echo "")
+meta beforeHead "$BEFORE_HEAD"
+meta beforeTree "$BEFORE_TREE"
+
+# ── agent ───────────────────────────────────────────────────────────────────────────────
+AGENT_EXIT=""
+if [ "$YEET_RUN_AGENT" = "1" ]; then
+  export PI_CODING_AGENT_SESSION_DIR="$YEET_SESSION_DIR"
+  export PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1
+  mkdir -p "$YEET_SESSION_DIR"
+
+  # Resume deterministically: pass -c only when a session file actually exists, rather than
+  # relying on -c failing gracefully on an empty dir.
+  RESUME=""
+  if ls "$YEET_SESSION_DIR"/*.jsonl >/dev/null 2>&1 || \
+     ls "$YEET_SESSION_DIR"/*/*.jsonl >/dev/null 2>&1; then
+    RESUME="-c"
+  fi
+  meta sessionMode "$([ -n "$RESUME" ] && echo continue || echo new)"
+
+  A0=$(date +%s)
+  # Redirect, never pipe: `pi ... | tee` discards pi's exit code (a pipeline's status is the
+  # last command's, and tee always succeeds) — that is the spike's fabricated success signal.
+  # stdin from /dev/null because pi -p otherwise blocks on the libkrun console device.
+  timeout -k 10 "$YEET_AGENT_TIMEOUT_S" \
+    pi -p "$(cat "$D/prompt.txt")" --model "$YEET_MODEL" -a $RESUME \
+    > "$D/agent.log" 2>&1 < /dev/null
+  AGENT_EXIT=$?
+  A1=$(date +%s)
+
+  meta agentExit    "$AGENT_EXIT"
+  meta agentTimedOut "$([ "$AGENT_EXIT" = "124" ] && echo 1 || echo 0)"
+  meta agentSeconds "$((A1 - A0))"
+
+  SESSION_FILE=$(find "$YEET_SESSION_DIR" -name '*.jsonl' -type f 2>/dev/null | head -1)
+  meta sessionFile "${SESSION_FILE:-}"
+else
+  meta agentRan 0
+fi
+
+# ── commit ──────────────────────────────────────────────────────────────────────────────
+# Exactly one commit per iteration, whatever the agent did. --soft keeps the tree
+# byte-identical while collapsing any commits the agent made on its own, so "the agent
+# committed even though we told it not to" is a non-event rather than a corrupted history.
+COMMITTED=0
+DIVERGED=0
+if [ "$YEET_RUN_AGENT" = "1" ] && [ -n "$BEFORE_HEAD" ]; then
+  if git merge-base --is-ancestor "$BEFORE_HEAD" HEAD 2>/dev/null; then
+    git reset --soft "$BEFORE_HEAD"
+  else
+    # The agent did something exotic (checkout, hard reset). Committing on top preserves the
+    # work; destroying it to force our shape would not.
+    DIVERGED=1
+  fi
+  git add -A
+  if ! git diff --cached --quiet; then
+    if git commit -q -F "$D/commit-msg.txt"; then COMMITTED=1; else meta gitError 1; fi
+  fi
+fi
+meta committed        "$COMMITTED"
+meta historyDiverged  "$DIVERGED"
+
+AFTER_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
+AFTER_TREE=$(git rev-parse 'HEAD^{tree}' 2>/dev/null || echo "")
+meta afterHead "$AFTER_HEAD"
+meta afterTree "$AFTER_TREE"
+# Tree SHA, not the diff: git's own content hash of the whole worktree, exact and free. This
+# is the no-progress detector, and it only works because run artifacts live at /yeet/iter-NNN
+# rather than inside the workspace.
+meta treeChanged "$([ "$BEFORE_TREE" != "$AFTER_TREE" ] && echo 1 || echo 0)"
+
+git diff --name-only -z "$BEFORE_HEAD" HEAD > "$D/changed.z" 2>/dev/null || : > "$D/changed.z"
+git diff --shortstat "$BEFORE_HEAD" HEAD > "$D/diffstat.txt" 2>/dev/null || : > "$D/diffstat.txt"
+
+# ── verify ──────────────────────────────────────────────────────────────────────────────
+if [ "$YEET_RUN_TEST" = "1" ] && [ -f "$D/test-cmd.sh" ]; then
+  T0=$(date +%s)
+  # Redirect (not pipe) for the exit code, and </dev/null so a runner that reads stdin cannot
+  # block on the console device until the timeout.
+  timeout -k 10 "$YEET_TEST_TIMEOUT_S" bash "$D/test-cmd.sh" \
+    > "$D/test.log" 2>&1 < /dev/null
+  TEST_EXIT=$?
+  T1=$(date +%s)
+  meta testExit     "$TEST_EXIT"
+  meta testTimedOut "$([ "$TEST_EXIT" = "124" ] && echo 1 || echo 0)"
+  meta testSeconds  "$((T1 - T0))"
+  meta testLogSha256 "$(sha256sum "$D/test.log" 2>/dev/null | cut -c1-16)"
+  meta testLogBytes  "$(wc -c < "$D/test.log" | tr -d ' ')"
+else
+  meta testRan 0
+fi
+
+git status --porcelain -z > "$D/status.z" 2>/dev/null || : > "$D/status.z"
+meta endedAtEpoch "$(date +%s)"
+
+# ── publish ─────────────────────────────────────────────────────────────────────────────
+# Atomic renames within one filesystem, meta before DONE, so the host never observes a
+# half-written result. DONE is the host's validity check.
+sync
+mv "$D/meta.kv.tmp" "$D/meta.kv"
+sync
+: > "$D/DONE.tmp"
+mv "$D/DONE.tmp" "$D/DONE"
+sync
+
+exit 0
