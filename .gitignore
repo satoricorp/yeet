@@ -1,0 +1,10 @@
+# The launcher is built + codesigned locally; the entitlement is machine-specific.
+guest/launcher/yeet-vm
+guest/launcher/*.dSYM/
+
+node_modules/
+.DS_Store
+
+# Nothing runtime belongs in this repo — images, workspaces, sessions and logs all live
+# under $YEET_HOME (~/.yeet). Keeping that property is deliberate: a 563 MB rootfs and
+# 12k-file clones must never be a git concern.
