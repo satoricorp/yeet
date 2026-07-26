@@ -82,10 +82,29 @@ for (const name of names) {
     `${state.coverage?.pct} vs ${blob.coverage?.pct}`);
 
   // The checkpoint has no counterpart in agent.json — it is new capability, not a copy — so
-  // assert its internal coherence instead: it must point at a committing iteration.
+  // comparing fields cannot validate it. Check it against GIT ITSELF instead.
+  //
+  // This exists because comparing-only-shared-fields let a real bug through: the checkpoint
+  // was storing afterTree (a TREE hash) rather than afterHead (a COMMIT). Both are 40 hex
+  // chars, both were non-empty, and agent.json had nothing to disagree with — so every
+  // structural check passed while `git checkout <commit>` would have failed. The only
+  // assertion that catches it is asking git what the object actually is.
   if (state.checkpoint) {
-    check(name, "checkpoint.commit", state.checkpoint.commit.length > 0, "empty commit");
+    const ws = join(AGENTS_DIR, name, "workspace");
     check(name, "checkpoint.id", state.checkpoint.id.length === 26, state.checkpoint.id);
+
+    const type = Bun.spawnSync(["git", "-C", ws, "cat-file", "-t", state.checkpoint.commit])
+      .stdout.toString().trim();
+    check(name, "checkpoint.commit is a COMMIT, not a tree", type === "commit",
+      `git says "${type}" for ${state.checkpoint.commit.slice(0, 12)}`);
+
+    // And it must be reachable — a commit sha that is not an ancestor of the branch is a
+    // checkpoint you cannot actually resume from.
+    const reachable = Bun.spawnSync(
+      ["git", "-C", ws, "merge-base", "--is-ancestor", state.checkpoint.commit, "HEAD"],
+    ).exitCode === 0;
+    check(name, "checkpoint.commit is reachable from HEAD", reachable,
+      `${state.checkpoint.commit.slice(0, 12)} is not an ancestor of HEAD`);
   }
 }
 

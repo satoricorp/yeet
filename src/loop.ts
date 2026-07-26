@@ -60,6 +60,12 @@ export type IterationResult = {
   invalidReason?: string;
   treeChanged: boolean;
   committed: boolean;
+  /** Commit sha at HEAD after this iteration — the resumable checkpoint. Distinct from
+   *  afterTree, which is a TREE hash: content-identical across commits, and not something
+   *  `git checkout` accepts. Confusing the two silently breaks resume. */
+  afterHead: string;
+  /** Tree hash, used ONLY for no-progress detection: git's own content hash of the whole
+   *  worktree, so two iterations that produced identical content compare equal. */
   afterTree: string;
   insertions: number;
   deletions: number;
@@ -208,7 +214,7 @@ export async function runIteration(
 
   const base: IterationResult = {
     n: opts.n, phase: opts.phase, dirName, valid: false, treeChanged: false, committed: false,
-    afterTree: "", insertions: 0, deletions: 0, filesChanged: 0, testExit: null, testLog: "",
+    afterHead: "", afterTree: "", insertions: 0, deletions: 0, filesChanged: 0, testExit: null, testLog: "",
     agentSeconds: 0, agentExit: null, agentVerdict: null, stopReason: bridge.stopReason,
     interrupted: false, touchedFrozen: [], session: EMPTY_SESSION, verdict: "none",
   };
@@ -255,6 +261,7 @@ export async function runIteration(
     touchedFrozen: opts.phase === "agent" && treeChanged ? store.touchedFrozen(agent) : [],
     treeChanged,
     committed: bool(meta, "committed"),
+    afterHead: meta.afterHead ?? "",
     afterTree: meta.afterTree ?? "",
     insertions: grab(/(\d+) insertion/),
     deletions: grab(/(\d+) deletion/),

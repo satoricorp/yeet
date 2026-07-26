@@ -240,7 +240,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
           outcome: r.agentVerdict ?? "no_edit", stoppedBy: r.stopReason, sessionEnd: r.session.turns,
         },
         git: {
-          commit: r.committed ? r.afterTree : null,
+          commit: r.committed ? r.afterHead : null,
           filesChanged: r.filesChanged, linesAdded: r.insertions, linesRemoved: r.deletions,
           protectedTestsChanged: r.touchedFrozen,
         },
