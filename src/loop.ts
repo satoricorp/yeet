@@ -1,28 +1,58 @@
 /**
- * loop.ts — one iteration, and the loop around it.
+ * loop.ts — one iteration, and the pieces the loop is made of.
  *
  * The loop is the point of the whole tool: "the agent stopped calling tools" is not "the goal
  * is met". Every iteration boots a fresh microVM, because the two things a persistent VM would
  * buy already survive on the shared filesystem for free — the workspace *is* a host directory,
  * and pi's session JSONL lets `-c` resume the conversation across a boot boundary.
+ *
+ * New in this era: an iteration is a CONVERSATION, not a batch job. The Bridge watches the
+ * shared mount while the VM runs — it relays the agent's ask_user questions to whoever is
+ * driving (a human at the TTY, or the recommendation policy), accepts set_verify proposals
+ * and binds them mid-flight (test-cmd.sh appears in the iteration dir while the guest is
+ * already running — virtio-fs makes late binding an ordinary file write), enforces the cost
+ * cap live, and decides when a silent guest is dead.
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { cloneTree, CURRENT_IMAGE } from "./host";
 import { writeRequest, readMeta, sawDone, num, bool, type Phase } from "./contract";
 import { runVM } from "./vm";
-import { findSessionFile, readSession, agentVerdict, EMPTY_SESSION, type SessionStats } from "./session";
+import { Bridge, prepareQaDir, type AskRequest, type VerifyRequest, type VerifyDecision } from "./bridge";
+import { findSessionFile, readSession, agentVerdict, costDelta, EMPTY_SESSION, type SessionStats } from "./session";
 import { bridgeKey, describeMissingKey } from "./keys";
+import { findLcov, parseLcov, type Coverage } from "./coverage";
 import * as store from "./agent";
 
 const REPO_ROOT = new URL("..", import.meta.url).pathname;
 
-export type Limits = { maxIterations: number; maxCostUsd: number; agentTimeoutS: number; testTimeoutS: number };
-export const DEFAULT_LIMITS: Limits = { maxIterations: 5, maxCostUsd: 2, agentTimeoutS: 900, testTimeoutS: 300 };
+export type Limits = { maxIterations: number; maxCostUsd: number; stallMs: number; hardCeilingMs: number };
+export const DEFAULT_LIMITS: Limits = {
+  maxIterations: 5,
+  maxCostUsd: 2,
+  /** No observable sign of life for this long ⇒ the controller escalates (STOP, then kill). */
+  stallMs: 10 * 60 * 1000,
+  /** Absolute per-VM ceiling — the backstop for a guest that LOOKS alive forever. */
+  hardCeilingMs: 2 * 60 * 60 * 1000,
+};
+
+/** How the driving side answers the guest. The CLI wires this to Ui; tests wire it to canned
+ *  answers. Everything is async because a human may be on the other end. */
+export type IterationIo = {
+  ask(q: AskRequest): Promise<string>;
+  verifyProposal(v: VerifyRequest): Promise<VerifyDecision>;
+  escalate?(action: "stop" | "kill", reason: "budget" | "stall"): void;
+};
+
+const AUTO_IO: IterationIo = {
+  ask: async (q) => q.recommended,
+  verifyProposal: async (v) => ({ command: v.command, testFiles: v.testFiles, coverageCommand: v.coverageCommand }),
+};
 
 export type IterationResult = {
   n: number;
   phase: Phase;
+  dirName: string;
   valid: boolean;
   invalidReason?: string;
   treeChanged: boolean;
@@ -35,16 +65,18 @@ export type IterationResult = {
   testLog: string;
   agentSeconds: number;
   agentExit: number | null;
-  /** edited | no_edit | error | timeout — derived from three independent signals, not prose.
+  /** edited | no_edit | error | stopped — derived from independent signals, not prose.
    *  "error" is materially different from "no_edit": a model that cannot emit a valid tool
    *  call will never make progress, so reporting it as a stall misdirects the user. */
-  agentVerdict: "edited" | "no_edit" | "error" | "timeout" | null;
-  /** The budget watchdog stopped the agent mid-work. */
-  stoppedByBudget: boolean;
-  /** The agent was killed mid-edit (timeout or budget), so the committed tree may be
-   *  syntactically inconsistent — measured once as a file ending `export { Parser as default;`.
-   *  Keeping the partial work is right; presenting it as an ordinary red iteration is not. */
+  agentVerdict: "edited" | "no_edit" | "error" | "stopped" | null;
+  /** Why the controller dropped STOP, when it did. */
+  stopReason: "budget" | "stall" | null;
+  /** The agent was stopped mid-edit, so the committed tree may be syntactically
+   *  inconsistent — measured once as a file ending `export { Parser as default;`. Keeping the
+   *  partial work is right; presenting it as an ordinary red iteration is not. */
   interrupted: boolean;
+  /** Frozen (pre-existing) test files whose content at HEAD no longer matches baseHead. */
+  touchedFrozen: string[];
   session: SessionStats;
   verdict: "green" | "red" | "none";
 };
@@ -52,19 +84,33 @@ export type IterationResult = {
 export async function runIteration(
   agent: store.Agent,
   opts: {
-    n: number; phase: Phase; runAgent: boolean; runTest: boolean; prompt?: string;
-    /** Enforced DURING the iteration, not just between iterations. */
-    budget?: { capUsd: number; spentUsd: number };
+    n: number;
+    phase: Phase;
+    runAgent: boolean;
+    runTest: boolean;
+    prompt?: string;
+    /** Directory name under the agent dir; defaults to iter-NNN. Confirm/coverage/chat use
+     *  their own namespaces so they never clobber an agent iteration's artifacts. */
+    dirName?: string;
+    /** For the coverage phase: run this instead of verify.command in the test slot. */
+    testCommandOverride?: string;
+    /** Enforced live, DURING the iteration. Present only for agent phases. */
+    budget?: { capUsd: number; spentBeforeUsd: number };
+    io?: IterationIo;
   },
 ): Promise<IterationResult> {
   const dir = store.agentDir(agent.name);
-  const iterName = `iter-${String(opts.n).padStart(3, "0")}`;
-  const iterDir = join(dir, iterName);
+  const dirName = opts.dirName ?? `iter-${String(opts.n).padStart(3, "0")}`;
+  const iterDir = join(dir, dirName);
   rmSync(iterDir, { recursive: true, force: true });
   mkdirSync(iterDir, { recursive: true });
+  prepareQaDir(iterDir);
 
-  // Stage the runner fresh each iteration so editing it takes effect without an image rebuild.
+  // Stage the runner and the pi extension fresh each iteration so editing either takes
+  // effect without an image rebuild.
+  mkdirSync(join(dir, "bin"), { recursive: true });
   copyFileSync(join(REPO_ROOT, "guest/yeet-run"), join(dir, "bin/yeet-run"));
+  copyFileSync(join(REPO_ROOT, "guest/yeet-tools.ts"), join(dir, "bin/yeet-tools.ts"));
   Bun.spawnSync(["chmod", "+x", join(dir, "bin/yeet-run")]);
 
   if (opts.runAgent) {
@@ -73,7 +119,8 @@ export async function runIteration(
     writeFileSync(join(dir, "run.env"), `export ${key.name}=${key.value}\n`, { mode: 0o600 });
   }
 
-  writeRequest(iterDir, `/yeet/${iterName}`, {
+  const testCommand = opts.testCommandOverride ?? agent.verify?.command;
+  writeRequest(iterDir, `/yeet/${dirName}`, {
     runId: agent.name,
     iteration: opts.n,
     phase: opts.phase,
@@ -82,11 +129,49 @@ export async function runIteration(
     model: agent.model,
     sessionDir: "/yeet/session",
     baseHead: agent.baseHead ?? "",
-    agentTimeoutS: DEFAULT_LIMITS.agentTimeoutS,
-    testTimeoutS: DEFAULT_LIMITS.testTimeoutS,
     prompt: opts.prompt,
-    commitMessage: opts.runAgent ? commitMessage(agent, opts.n) : undefined,
-    testCommand: opts.runTest && agent.testCommand ? agent.testCommand : undefined,
+    commitMessage: opts.phase === "agent" ? commitMessage(agent, opts.n) : undefined,
+    // May be absent for a fresh agent — set_verify can bind it mid-iteration (below).
+    testCommand: opts.runTest && testCommand ? testCommand : undefined,
+  });
+
+  const io = opts.io ?? AUTO_IO;
+  const bridge = new Bridge({
+    iterDir,
+    sessionDir: join(dir, "session"),
+    stallMs: DEFAULT_LIMITS.stallMs,
+    agentPhase: opts.runAgent,
+    budget: opts.runAgent && opts.budget ? { capUsd: opts.budget.capUsd, spentBeforeUsd: opts.budget.spentBeforeUsd } : undefined,
+    onAsk: (q) => io.ask(q),
+    onVerify: async (v) => {
+      // Models re-call set_verify with the same content more often than you'd think. An
+      // identical re-proposal is a no-op: no re-prompt, no duplicate event, same binding.
+      const cur = agent.verify;
+      if (
+        cur &&
+        cur.command === v.command &&
+        JSON.stringify(cur.testFiles) === JSON.stringify(v.testFiles) &&
+        (cur.coverageCommand ?? null) === (v.coverageCommand ?? null)
+      ) {
+        return { command: cur.command, testFiles: cur.testFiles, coverageCommand: cur.coverageCommand };
+      }
+      const decision = await io.verifyProposal(v);
+      // Bind it: persist on the agent (with the frozen fingerprint of PRE-EXISTING tests),
+      // and stage test-cmd.sh into the LIVE iteration dir so this very run verifies with it.
+      agent.verify = {
+        command: decision.command,
+        testFiles: decision.testFiles,
+        coverageCommand: decision.coverageCommand,
+        source: "agent",
+        frozen: store.frozenTests(agent, decision.testFiles),
+      };
+      store.save(agent);
+      if (opts.runTest) {
+        writeFileSync(join(iterDir, "test-cmd.sh"), decision.command + "\n", { mode: 0o700 });
+      }
+      return decision;
+    },
+    onEscalate: (action, reason) => io.escalate?.(action, reason),
   });
 
   const rootfs = join(dir, "rootfs");
@@ -97,37 +182,34 @@ export async function runIteration(
     {
       root: rootfs,
       mounts: { yeet: dir },
-      env: { YEET_DIR: `/yeet/${iterName}` },
+      env: { YEET_DIR: `/yeet/${dirName}` },
       workdir: "/yeet/workspace",
       consolePath: join(iterDir, "console.log"),
       stderrPath: join(iterDir, "vm.stderr"),
-      timeoutMs: (DEFAULT_LIMITS.agentTimeoutS + DEFAULT_LIMITS.testTimeoutS + 120) * 1000,
-      budget:
-        opts.runAgent && opts.budget
-          ? {
-              stopFile: join(iterDir, "STOP"),
-              // Read the live session file the guest is still appending to. Costs nothing —
-              // it is a host-side file read of a shared-mount path.
-              check: () => {
-                const live = readSession(findSessionFile(join(dir, "session")));
-                return opts.budget!.spentUsd + live.costUsd >= opts.budget!.capUsd;
-              },
-            }
-          : undefined,
+      timeoutMs: DEFAULT_LIMITS.hardCeilingMs,
+      watcher: bridge,
     },
     ["/usr/local/bin/yeet-init", "/yeet/bin/yeet-run"],
   );
   rmSync(rootfs, { recursive: true, force: true });
 
   const base: IterationResult = {
-    n: opts.n, phase: opts.phase, valid: false, treeChanged: false, committed: false,
+    n: opts.n, phase: opts.phase, dirName, valid: false, treeChanged: false, committed: false,
     afterTree: "", insertions: 0, deletions: 0, filesChanged: 0, testExit: null, testLog: "",
-    agentSeconds: 0, agentExit: null, agentVerdict: null, stoppedByBudget: false,
-    interrupted: false, session: EMPTY_SESSION, verdict: "none",
+    agentSeconds: 0, agentExit: null, agentVerdict: null, stopReason: bridge.stopReason,
+    interrupted: false, touchedFrozen: [], session: EMPTY_SESSION, verdict: "none",
   };
 
   if (outcome.kind !== "ok" || !sawDone(iterDir)) {
-    return { ...base, invalidReason: outcome.kind === "ok" ? "no DONE sentinel" : JSON.stringify(outcome) };
+    return {
+      ...base,
+      invalidReason:
+        outcome.kind === "killed"
+          ? `controller killed the VM: ${outcome.why}`
+          : outcome.kind === "ok"
+            ? "no DONE sentinel"
+            : JSON.stringify(outcome),
+    };
   }
 
   let meta;
@@ -147,16 +229,17 @@ export async function runIteration(
   const testExit = meta.testExit !== undefined ? num(meta, "testExit", -1) : null;
   const treeChanged = bool(meta, "treeChanged");
   const agentExit = meta.agentExit !== undefined ? num(meta, "agentExit", -1) : null;
+  const stopped = bool(meta, "stopRequested");
   return {
     n: opts.n,
     phase: opts.phase,
+    dirName,
     valid: true,
     agentExit,
-    agentVerdict: opts.runAgent
-      ? agentVerdict(session, treeChanged, agentExit ?? -1, bool(meta, "agentTimedOut"))
-      : null,
-    stoppedByBudget: bool(meta, "stoppedByBudget"),
-    interrupted: bool(meta, "agentTimedOut") || bool(meta, "stoppedByBudget"),
+    agentVerdict: opts.runAgent ? agentVerdict(session, treeChanged, agentExit ?? -1, stopped) : null,
+    stopReason: bridge.stopReason,
+    interrupted: stopped,
+    touchedFrozen: opts.phase === "agent" && treeChanged ? store.touchedFrozen(agent) : [],
     treeChanged,
     committed: bool(meta, "committed"),
     afterTree: meta.afterTree ?? "",
@@ -168,6 +251,55 @@ export async function runIteration(
     agentSeconds: num(meta, "agentSeconds"),
     session,
     verdict: testExit === null ? "none" : testExit === 0 ? "green" : "red",
+  };
+}
+
+/** One coverage run: boots a VM, runs verify.coverageCommand in the test slot, then reads
+ *  whatever lcov file it left on the shared workspace. Returns null when unmeasurable. */
+export async function runCoverage(agent: store.Agent, n: number): Promise<Coverage | null> {
+  const verify = agent.verify;
+  if (!verify?.coverageCommand) return null;
+  const r = await runIteration(agent, {
+    n,
+    phase: "coverage",
+    runAgent: false,
+    runTest: true,
+    dirName: `coverage-${String(n).padStart(3, "0")}`,
+    testCommandOverride: verify.coverageCommand,
+  });
+  if (!r.valid) return null;
+  const lcov = findLcov(store.workspaceDir(agent.name));
+  if (!lcov) return null;
+  try {
+    return parseLcov(readFileSync(lcov, "utf8"), verify.testFiles, store.workspaceDir(agent.name));
+  } catch {
+    return null;
+  }
+}
+
+/** `yeet ask <name> "<question>"` — a conversation with the agent about its work. Same
+ *  session, fresh VM, zero commits (the runner discards chat-phase edits). Returns the
+ *  answer text and what the exchange cost. */
+export async function runChat(
+  agent: store.Agent,
+  question: string,
+  io: IterationIo,
+): Promise<{ answer: string | null; costUsd: number; valid: boolean; reason?: string }> {
+  const before = readSession(findSessionFile(join(store.agentDir(agent.name), "session")));
+  const r = await runIteration(agent, {
+    n: 0,
+    phase: "chat",
+    runAgent: true,
+    runTest: false,
+    dirName: `chat-${Date.now().toString(36)}`,
+    prompt: chatPrompt(agent, question),
+    io,
+  });
+  if (!r.valid) return { answer: null, costUsd: 0, valid: false, reason: r.invalidReason };
+  return {
+    answer: r.session.finalMessage,
+    costUsd: costDelta({ file: before.file, costUsd: before.costUsd }, r.session),
+    valid: true,
   };
 }
 
@@ -185,31 +317,57 @@ function commitMessage(agent: store.Agent, n: number): string {
 
 /** Iteration 1 gets the task and the rules. Telling the agent how it will be judged turns it
  *  into its own first-line verifier, which collapses iterations — the extra in-agent test runs
- *  cost far less than another whole VM round trip. */
-export function firstPrompt(agent: store.Agent): string {
+ *  cost far less than another whole VM round trip.
+ *
+ *  The register here is deliberately flat. Personality belongs to yeet's own strings
+ *  (voice.ts), not to the prompt of the thing writing code — with ONE scoped exception: how
+ *  ask_user questions may open when the task itself is off. That is where "you sure you want
+ *  me to make this?" comes from, and it is the only personality the worker is permitted. */
+export function firstPrompt(agent: store.Agent, dirName: string): string {
   const lines = [
     agent.task,
     "",
     `You are in /yeet/workspace, a git repository on branch ${agent.branch}.`,
+    "",
+    "Before you build: if the task is ambiguous or a real decision has more than one defensible",
+    "answer, use the ask_user tool first. Ask at most a few sharp questions, always with options",
+    "and a recommended answer. If the task is vague or plain silly, you may open your question",
+    "with one dry line — then get to work. Do not ask about things you can decide yourself.",
+    "",
+    "Verification is not optional. Early on, register how your work gets proven with the",
+    "set_verify tool: a shell command that exits 0 only when the work is correct.",
+    "  - If the workspace already has a test setup, use that.",
+    "  - If it does not, write tests as part of your work and register the command that runs them.",
+    "  - Include testFiles globs, and a coverageCommand that writes an lcov.info if the stack",
+    "    supports it (e.g. `bun test --coverage --coverage-reporter=lcov`).",
+    "After every iteration yeet runs the registered command in a fresh VM; it must exit 0.",
+    "Run it yourself before you finish.",
+    "",
+    "Do not weaken or rewrite tests that existed before you started to make them pass — yeet",
+    "fingerprints those and will flag it. If a pre-existing test is wrong, say so via ask_user.",
+    "",
+    `Before you finish, write /yeet/${dirName}/summary.md: 2-4 sentences for a non-technical`,
+    "reader — what you built, how it is checked, anything left to do. No jargon.",
+    "",
+    "Do not commit; yeet commits for you after you stop.",
   ];
-  if (agent.testCommand) {
-    lines.push(
-      "",
-      "Your work will be verified by running, in that directory:",
-      `    ${agent.testCommand}`,
-      "It must exit 0. Run it yourself to check your work before you finish — please do.",
-      "",
-      "Do not modify test files. If you believe a test is wrong, say so explicitly and explain why.",
-    );
-  }
-  lines.push("", "Do not commit; yeet commits for you after you stop.");
   return lines.join("\n");
 }
 
 /** Iteration N gets only the delta. pi's session already holds every file it read and every
  *  edit it made, so re-narrating that would be redundant and expensive. The full log stays at a
  *  stable guest path — the prompt is an index into it, not a container for it. */
-export function retryPrompt(prev: IterationResult, agent: store.Agent, iterName: string): string {
+export function retryPrompt(prev: IterationResult, agent: store.Agent, dirName: string): string {
+  if (!agent.verify) {
+    return [
+      "You have not registered verification yet, and yeet will not call this done until you do.",
+      "Use the set_verify tool NOW: the command that proves the work, testFiles globs, and a",
+      "coverageCommand if the stack supports lcov. Write tests first if none exist.",
+      "",
+      `Then continue the task. Before you finish, update /yeet/${dirName}/summary.md.`,
+    ].join("\n");
+  }
+
   const clean = prev.testLog.replace(/\x1b\[[0-9;]*m/g, "");
   const lines = clean.split("\n");
   const tail = lines.slice(-120);
@@ -218,16 +376,31 @@ export function retryPrompt(prev: IterationResult, agent: store.Agent, iterName:
   const excerpt = (headMatters ? [...head, "…", ...tail] : tail).join("\n").slice(-4096);
 
   return [
-    `The verifier ran \`${agent.testCommand}\` in /yeet/workspace on your last change.`,
+    `The verifier ran \`${agent.verify.command}\` in /yeet/workspace on your last change.`,
     `It FAILED (exit ${prev.testExit}).`,
     "",
     "--- output (truncated) ---",
     excerpt,
     "--- end ---",
     "",
-    `Full output: /yeet/${iterName}/test.log  (read it if you need more)`,
-    prev.committed ? `Your last change was committed: ${prev.filesChanged} file(s), +${prev.insertions}/-${prev.deletions}.` : "You made no committed change last time.",
+    `Full output: /yeet/${prev.dirName}/test.log  (read it if you need more)`,
+    prev.committed
+      ? `Your last change was committed: ${prev.filesChanged} file(s), +${prev.insertions}/-${prev.deletions}.`
+      : "You made no committed change last time.",
     "",
-    "Fix the failures.",
+    `Fix the failures. Before you finish, update /yeet/${dirName}/summary.md (2-4 plain sentences).`,
+  ].join("\n");
+}
+
+function chatPrompt(agent: store.Agent, question: string): string {
+  return [
+    "The person you built this for has a question about the work. Answer it in plain text.",
+    "Do NOT modify any files — this is a conversation, not a work order (any edits you make",
+    "will be discarded). Read the workspace if you need to check something.",
+    "",
+    "Answer like a seasoned developer explaining to a smart friend: direct, concrete, no",
+    "jargon unless they used it first, a little dry wit welcome.",
+    "",
+    `Question: ${question}`,
   ].join("\n");
 }
