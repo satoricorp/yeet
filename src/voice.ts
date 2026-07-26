@@ -78,3 +78,20 @@ export const LINES = {
     `The check command (\`${cmd}\`) doesn't even run. I'm not spending your money until that's fixed.`,
   flaky: "It passed, then it didn't pass when I checked again. That's called flaky, and flaky doesn't ship.",
 } as const;
+
+/**
+ * One dry line for how an agent ended, for the top of `yeet ask`. Deliberately not LINES.* —
+ * those are written for the moment a run finishes ("we did it!"), which reads as strange when
+ * you are looking something up three days later.
+ */
+export function plebState(state: string, model: string): string {
+  switch (state) {
+    case "passed": return "it works, and the tests agree.";
+    case "running": return "still going.";
+    case "stalled": return "it got stuck and I stopped it.";
+    case "capped": return "it ran out of budget before finishing.";
+    case "unverified": return "it built something, but nothing proves it works.";
+    case "failed": return `it fell over. ${blameProvider(model)}'s model, not you.`;
+    default: return state;
+  }
+}

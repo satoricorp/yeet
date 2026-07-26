@@ -27,6 +27,7 @@ import {
   type IterationIo, type IterationResult,
 } from "./loop";
 import { Ui, C, usd, dur, type Mode } from "./ui";
+import { plainText, plebMoney, plebState } from "./voice";
 import { loadConfig, saveConfig, DEFAULT_MODEL } from "./config";
 import { costDelta, findSessionFile, readSession } from "./session";
 import { record } from "./events";
@@ -470,31 +471,60 @@ async function cmdAsk(name: string, question: string | undefined, ui: Ui): Promi
       return 0;
     }
     const v = agent.verify;
-    console.log("");
-    console.log(`${C.bold(agent.name)}  ${C.dim(`(${agent.state})`)}`);
-    console.log(`${C.dim("task")}     ${agent.task}`);
-    console.log(`${C.dim("model")}    ${agent.model}`);
-    console.log(`${C.dim("origin")}   ${agent.origin ?? "none — isolated"}`);
-    console.log(`${C.dim("verify")}   ${v ? `${v.command} ${C.dim(`(${v.source})`)}` : "never registered"}`);
-    if (v?.coverageCommand) console.log(`${C.dim("coverage")} ${v.coverageCommand}${agent.coverage ? ` → ${agent.coverage.pct}% (${agent.coverage.coveredLines}/${agent.coverage.totalLines} lines)` : ""}`);
-    if (v && Object.keys(v.frozen).length) console.log(`${C.dim("frozen")}   ${Object.keys(v.frozen).length} pre-existing test file(s) fingerprinted`);
-    console.log(`${C.dim("branch")}   ${agent.branch}`);
-    console.log(`${C.dim("cost")}     ${usd(agent.costUsd)} over ${agent.iterations.length} iteration(s)`);
-    if (agent.iterations.length) {
-      console.log("");
-      for (const it of agent.iterations) {
-        const verdict = it.verdict === "green" ? C.green("green") : it.verdict === "red" ? C.red(`red · exit ${it.testExit}`) : C.dim("no verifier");
-        const flags = `${it.touchedFrozenTests ? C.yellow(" ⚠tests") : ""}${it.stopReason ? C.yellow(` ⏹${it.stopReason}`) : ""}`;
-        console.log(` ${String(it.n).padStart(2)}  ${dur(it.agentSeconds).padEnd(8)}${usd(it.costUsd).padEnd(9)}${(it.treeChanged ? `+${it.insertions} −${it.deletions} ${it.filesChanged}f` : "no edit").padEnd(18)}${verdict}${flags}`);
-      }
-    }
     const summary = lastSummary(agent);
-    if (summary) {
-      console.log("");
-      console.log(`${C.dim("in its own words:")} ${summary}`);
-    }
+    const ws = store.workspaceDir(agent.name);
+    const last = agent.iterations.at(-1);
+
+    // Default view answers the two questions someone actually has: what is it, and how do I
+    // run it. The dossier — model, verify command, frozen fingerprints, per-iteration table —
+    // is for someone debugging yeet, so it lives behind --smarty.
     console.log("");
-    console.log(C.dim(`artifacts: ${store.agentDir(agent.name)} · talk to it: yeet ask ${agent.name} "<question>"`));
+    if (ui.mode === "smarty") {
+      console.log(`${C.bold(agent.name)}  ${C.dim(`(${agent.state})`)}`);
+      console.log(`${C.dim("task")}     ${agent.task}`);
+      console.log(`${C.dim("model")}    ${agent.model}`);
+      console.log(`${C.dim("origin")}   ${agent.origin ?? "none — isolated"}`);
+      console.log(`${C.dim("verify")}   ${v ? `${v.command} ${C.dim(`(${v.source})`)}` : "never registered"}`);
+      if (v?.coverageCommand) console.log(`${C.dim("coverage")} ${v.coverageCommand}${agent.coverage ? ` → ${agent.coverage.pct}% (${agent.coverage.coveredLines}/${agent.coverage.totalLines} lines)` : ""}`);
+      if (v && Object.keys(v.frozen).length) console.log(`${C.dim("frozen")}   ${Object.keys(v.frozen).length} pre-existing test file(s) fingerprinted`);
+      console.log(`${C.dim("branch")}   ${agent.branch}`);
+      console.log(`${C.dim("cost")}     ${usd(agent.costUsd)} over ${agent.iterations.length} iteration(s)`);
+      if (agent.iterations.length) {
+        console.log("");
+        for (const it of agent.iterations) {
+          const verdict = it.verdict === "green" ? C.green("green") : it.verdict === "red" ? C.red(`red · exit ${it.testExit}`) : C.dim("no verifier");
+          const flags = `${it.touchedFrozenTests ? C.yellow(" tests-touched") : ""}${it.stopReason ? C.yellow(` stopped:${it.stopReason}`) : ""}`;
+          console.log(` ${String(it.n).padStart(2)}  ${dur(it.agentSeconds).padEnd(8)}${usd(it.costUsd).padEnd(9)}${(it.treeChanged ? `+${it.insertions} −${it.deletions} ${it.filesChanged}f` : "no edit").padEnd(18)}${verdict}${flags}`);
+        }
+      }
+      if (summary) {
+        console.log("");
+        console.log(`${C.dim("in its own words:")} ${summary}`);
+      }
+      console.log("");
+      console.log(C.dim(`artifacts: ${store.agentDir(agent.name)}`));
+      return 0;
+    }
+
+    console.log(`${C.bold(agent.name)} — ${plebState(agent.state, agent.model)}`);
+    console.log("");
+    // The summary is where the agent says what the thing does and how to run it; the build
+    // prompt asks for exactly that. Leading with it is the whole point of this command.
+    console.log(`  ${summary ? plainText(summary, 500) : C.dim("it never left a summary — try yeet ask " + agent.name + ' "what did you build?"')}`);
+    console.log("");
+    console.log(`  built    ${agent.iterations.length} round${agent.iterations.length === 1 ? "" : "s"}, ${plebMoney(agent.costUsd)}`);
+    console.log(`  checked  ${v ? (last?.verdict === "green" ? "tests pass" : "tests are failing") : C.yellow("nothing verifies this")}${agent.coverage ? C.dim(` · ${agent.coverage.pct}% of the code covered`) : ""}`);
+    console.log(`  lives in ${ws.replace(process.env.HOME ?? "", "~")}`);
+
+    const steps: Array<[string, string]> = [
+      [`cd ${ws.replace(process.env.HOME ?? "", "~")}`, "run it yourself"],
+      [`yeet ${agent.name} "…"`, "keep building"],
+      [`yeet ask ${agent.name} "why …?"`, "ask it about its own work (a few cents)"],
+    ];
+    const w = Math.max(...steps.map(([c]) => c.length)) + 3;
+    console.log("");
+    console.log(C.dim("next"));
+    for (const [cmd, why] of steps) console.log(`  ${cmd.padEnd(w)}${C.dim(why)}`);
     return 0;
   }
 
