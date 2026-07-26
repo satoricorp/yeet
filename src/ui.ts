@@ -229,7 +229,10 @@ export class Ui {
         // Always end with somewhere to go. Every line is a command you can paste. Widths are
         // computed rather than hand-padded, because the name length varies per agent.
         const steps: Array<[string, string]> = [
-          [`yeet ${name} "…"`, "keep going — it remembers everything"],
+          [`yeet ${name} "…"`, "keep building"],
+          // The workspace is an ordinary directory on disk — the most common next question is
+          // "how do I actually try this", and the answer is cd there and run it.
+          [`cd ${e.workspace.replace(process.env.HOME ?? "", "~")}`, "run it yourself"],
           [`yeet ask ${name}`, "what it did, in detail"],
           e.origin
             ? [`yeet ${name} push`, `send the branch to ${e.origin}`]

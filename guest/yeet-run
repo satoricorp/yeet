@@ -59,6 +59,34 @@ meta startedAtEpoch "$(date +%s)"
 
 git config --global --add safe.directory '*' 2>/dev/null || true
 
+# Keep build output out of the commit. The runner commits with `git add -A`, so without this a
+# single `bun install` puts 500 files of node_modules on the branch — measured — which makes
+# the diffstat meaningless, the branch unmergeable, and the tree SHA churn so much that
+# no-progress detection can never fire. Asking for a coverage command made it worse by adding
+# lcov.info to every run.
+#
+# .git/info/exclude, NOT .gitignore: this is yeet's opinion about its own sandbox, and it must
+# not appear in the diff the user eventually merges.
+mkdir -p .git/info 2>/dev/null || true
+cat > .git/info/exclude <<'EXCLUDE'
+node_modules/
+.pnpm-store/
+vendor/
+target/
+dist/
+build/
+.next/
+__pycache__/
+.pytest_cache/
+.venv/
+venv/
+coverage/
+.nyc_output/
+lcov.info
+*.log
+.DS_Store
+EXCLUDE
+
 BEFORE_HEAD=$(git rev-parse HEAD 2>/dev/null || echo "")
 BEFORE_TREE=$(git rev-parse 'HEAD^{tree}' 2>/dev/null || echo "")
 meta beforeHead "$BEFORE_HEAD"
