@@ -83,6 +83,8 @@ venv/
 coverage/
 .nyc_output/
 lcov.info
+.lcov.info.*
+*.lcov
 *.log
 .DS_Store
 EXCLUDE

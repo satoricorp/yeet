@@ -25,8 +25,10 @@ const SAFE_VALUE = /^[A-Za-z0-9._:/+=-]*$/;
  * chat: the agent talks (yeet ask), and the runner discards any file changes after.
  * coverage: run a coverage command in test-cmd.sh's slot; no agent, no commit, no cleanup —
  * the host reads the lcov artifact off the shared workspace afterwards.
+ * ablation: blank the implementation and re-run the tests. A suite that still passes was
+ *   never testing the code — mutation testing with a single maximally destructive mutant.
  */
-export type Phase = "baseline" | "agent" | "confirm" | "chat" | "coverage";
+export type Phase = "baseline" | "agent" | "confirm" | "chat" | "coverage" | "ablation";
 
 export type IterationRequest = {
   runId: string;

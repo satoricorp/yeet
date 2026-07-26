@@ -18,7 +18,7 @@
  * Exit codes are part of the interface: 0 passed · 1 usage/infra · 2 stalled · 3 capped ·
  * 4 failed · 5 unverified.
  */
-import { existsSync, mkdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { AGENTS_DIR, CURRENT_IMAGE, LAUNCHER, tryLock } from "./host";
 import * as store from "./agent";
@@ -30,6 +30,7 @@ import { Ui, C, usd, dur, type Mode } from "./ui";
 import { loadConfig, saveConfig, DEFAULT_MODEL } from "./config";
 import { costDelta, findSessionFile, readSession } from "./session";
 import { record } from "./events";
+import { checkCounts, checkCheats, implementationFiles } from "./gates";
 import { reviewWorkspace } from "./review";
 
 const EXIT = { passed: 0, usage: 1, stalled: 2, capped: 3, failed: 4, unverified: 5 } as const;
@@ -277,6 +278,17 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
         agentVerdict: r.agentVerdict, interrupted: r.interrupted, touchedFrozenTests: r.touchedFrozen.length > 0,
       });
 
+      // Green is not evidence that anything ran: bun, go and cargo all exit 0 on an empty
+      // suite. And a diff that disables type checking turns red green without touching code.
+      // The diff is read host-side from the commit the runner just made — the guest reports
+      // file names and a shortstat, not the patch text the cheat scan needs.
+      const patch = r.committed
+        ? Bun.spawnSync(["git", "-C", store.workspaceDir(agent.name), "show", "--unified=0", "--format=", r.afterHead]).stdout.toString()
+        : "";
+      for (const f of [...checkCounts(r.testLog), ...checkCheats(patch)]) {
+        ui.event({ event: "warning", message: `${f.detail} (${f.gate})` });
+      }
+
       // An agent that cannot emit a valid tool call will never make progress, so retrying it
       // is spend with no expected value. Two in a row means the model, not the task, is the
       // problem — say so, rather than reporting a stall the user would misread as difficulty.
@@ -351,6 +363,35 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
     agent.state = outcome;
     store.save(agent);
     record(agent.name, { kind: "status", status: outcome, reason: stopNote || null });
+
+    // Ablation: blank the implementation and re-run the suite. If it STILL passes, the tests
+    // were never testing the code — mutation testing with a single maximally destructive
+    // mutant, and the cheapest high-signal check available. Run by hand once on a real agent
+    // it took one command to prove 8 of 14 tests were genuinely load-bearing.
+    if (outcome === "passed" && agent.verify) {
+      const ws = store.workspaceDir(agent.name);
+      const changed = Bun.spawnSync(["git", "-C", ws, "diff", "--name-only", agent.baseHead ?? "HEAD", "HEAD"])
+        .stdout.toString().split("\n").filter(Boolean);
+      const impl = implementationFiles(changed, agent.verify.testFiles);
+      if (impl.length > 0) {
+        const saved = impl.map((f) => [f, readFileSync(join(ws, f), "utf8")] as const);
+        try {
+          for (const [f] of saved) writeFileSync(join(ws, f), "");
+          const abl = await runIteration(agent, {
+            n: 0, phase: "ablation", runAgent: false, runTest: true, dirName: "ablation",
+          });
+          // A blanked implementation that still passes means the suite proves nothing. Said,
+          // not enforced — a gate that halts on its own misread is worse than the problem.
+          if (abl.valid && abl.verdict === "green") {
+            ui.event({ event: "warning", message: `the tests still pass with ${impl.join(", ")} emptied out — they are not actually testing the code` });
+          }
+        } finally {
+          // Restore from memory rather than `git checkout`, so an uncommitted change made
+          // between the commit and here is not silently discarded.
+          for (const [f, body] of saved) writeFileSync(join(ws, f), body);
+        }
+      }
+    }
 
     // Coverage: measured once, after a confirmed pass — a number for "how much of the app do
     // the tests actually exercise", which is what makes a green light worth believing.
