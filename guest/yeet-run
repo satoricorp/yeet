@@ -115,7 +115,13 @@ if [ "$YEET_RUN_AGENT" = "1" ]; then
   # last command's, and tee always succeeds) — that is the spike's fabricated success signal.
   # stdin from /dev/null because pi -p otherwise blocks on the libkrun console device.
   # -e loads yeet's own tools (ask_user, set_verify) — see guest/yeet-tools.ts.
-  pi -p "$(cat "$D/prompt.txt")" --model "$YEET_MODEL" -a $RESUME \
+  # stdbuf -oL: line-buffered, so agent.log fills as the agent works instead of at exit.
+  # Without it a stopped agent loses EVERYTHING — measured: 851 seconds of work, SIGTERM from
+  # the budget watchdog, and a 0-byte log, because pi's stdout is block-buffered when it is not
+  # a tty. That is exactly backwards: the runs that get stopped are the expensive, confusing
+  # ones you most need to read, and the next iteration's retry prompt has nothing to feed back.
+  stdbuf -oL -eL \
+    pi -p "$(cat "$D/prompt.txt")" --model "$YEET_MODEL" -a $RESUME \
     -e /yeet/bin/yeet-tools.ts \
     > "$D/agent.log" 2>&1 < /dev/null &
   PI_PID=$!
@@ -131,8 +137,15 @@ if [ "$YEET_RUN_AGENT" = "1" ]; then
   ( set +x
     while kill -0 "$PI_PID" 2>/dev/null; do
       if [ -f "$D/STOP" ]; then
+        # Graceful first, and give it room. SIGTERM lets pi finish the sentence it is writing,
+        # flush, and close the session file cleanly; SIGKILL loses whatever was still in flight.
+        # 15s rather than 3 because a model mid-token-stream needs longer than a shell script,
+        # and the alternative — losing the log of an expensive run — is worse than waiting.
         kill -TERM "$PI_PID" 2>/dev/null
-        sleep 3
+        for _ in $(seq 1 15); do
+          kill -0 "$PI_PID" 2>/dev/null || break
+          sleep 1
+        done
         kill -KILL "$PI_PID" 2>/dev/null
         break
       fi

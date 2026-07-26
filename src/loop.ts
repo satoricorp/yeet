@@ -406,8 +406,10 @@ export function firstPrompt(agent: store.Agent, dirName: string): string {
     // so a markdown document with headings and a "Verification" section reads as a foreign
     // object dropped into the terminal. Two sentences of plain prose land better than four.
     `Before you finish, write /yeet/${dirName}/summary.md — plain prose, 2-3 sentences, no`,
-    "markdown, no headings, no bullet points, no title. Say what the thing DOES and how someone",
-    "would run it. Skip the testing; that is assumed and yeet reports it separately. Write it",
+    "markdown, no headings, no bullet points, no title. Say what the thing DOES and what it is",
+    "for. Do NOT give shell commands, file paths, or instructions like \"run this from the repo",
+    "root\" — the person reading has no idea where any of this lives and never needs to: yeet",
+    "runs things for them. Skip the testing; that is assumed and reported separately. Write it",
     "the way you'd tell a competent colleague in passing: matter-of-fact, no salesmanship, no",
     `"I have successfully implemented".`,
     "",

@@ -230,9 +230,9 @@ export class Ui {
         // computed rather than hand-padded, because the name length varies per agent.
         const steps: Array<[string, string]> = [
           [`yeet ${name} "…"`, "keep building"],
-          // The workspace is an ordinary directory on disk — the most common next question is
-          // "how do I actually try this", and the answer is cd there and run it.
-          [`cd ${e.workspace.replace(process.env.HOME ?? "", "~")}`, "run it yourself"],
+          // Deliberately NOT a path. Someone using yeet has an agent, not a filesystem — they
+          // should never need to know there is a git repo or where it lives. yeet runs it.
+          [`yeet ${name} test`, "run its checks and show the output"],
           [`yeet ask ${name}`, "what it did, in detail"],
           e.origin
             ? [`yeet ${name} push`, `send the branch to ${e.origin}`]

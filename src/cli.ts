@@ -7,6 +7,7 @@
  *   yeet ask fix-auth                      full detail of the last run (free)
  *   yeet ask fix-auth "why that lib?"      talk to the agent about its work
  *   yeet fix-auth config origin <url>      connect a repo (import if unbuilt; enables push)
+ *   yeet fix-auth test                     run its checks and show the output
  *   yeet fix-auth push                     push the branch to origin — from the host
  *   yeet ls / yeet rm <name>               list / delete
  *   yeet config smarty on                  dev detail by default
@@ -457,6 +458,58 @@ function cmdLs(ui: Ui): number {
   return 0;
 }
 
+/**
+ * yeet <name> test — run the agent's own checks and show you the output.
+ *
+ * Exists because the alternative was telling people to cd into a path. Someone using yeet has
+ * an agent, not a filesystem: they should never need to know there is a git repo, where it is,
+ * or which package manager it chose. yeet knows the verify command; yeet runs it.
+ */
+async function cmdTest(name: string, ui: Ui): Promise<number> {
+  if (!store.exists(name)) {
+    ui.event({ event: "error", message: `no agent named "${name}" — see yeet ls` });
+    return EXIT.usage;
+  }
+  const agent = store.load(name);
+  if (!agent.verify) {
+    ui.event({ event: "error", message: `${name} never registered a way to check its work, so there is nothing to run` });
+    return EXIT.unverified;
+  }
+
+  const lock = tryLock(`${store.agentDir(name)}/.lock`);
+  if (!lock) {
+    ui.event({ event: "error", message: `${name} is busy right now` });
+    return EXIT.usage;
+  }
+  try {
+    if (ui.mode !== "json") console.log(C.dim(`running its checks in a fresh sandbox…`));
+    const r = await runIteration(agent, {
+      n: 0, phase: "confirm", runAgent: false, runTest: true, dirName: "manual-test",
+    });
+    if (!r.valid) {
+      ui.event({ event: "error", message: r.invalidReason ?? "the sandbox did not come back" });
+      return EXIT.failed;
+    }
+    record(name, {
+      kind: "verify_run", reason: "manual", command: agent.verify.command,
+      exitCode: r.testExit ?? -1, passed: r.verdict === "green",
+    });
+
+    if (ui.mode === "json") {
+      console.log(JSON.stringify({ event: "test", agent: name, exitCode: r.testExit, passed: r.verdict === "green", output: r.testLog }));
+    } else {
+      console.log("");
+      for (const line of r.testLog.trimEnd().split("\n")) console.log(`  ${line}`);
+      console.log("");
+      console.log(r.verdict === "green" ? C.green("  all good.") : C.red(`  that is a fail (exit ${r.testExit}).`));
+      if (r.verdict !== "green") console.log(C.dim(`  tell it to fix them: yeet ${name} "the checks are failing"`));
+    }
+    return r.verdict === "green" ? EXIT.passed : EXIT.failed;
+  } finally {
+    lock.release();
+  }
+}
+
 /** yeet ask <name> — the full story, free. With a question — a paid conversation. */
 async function cmdAsk(name: string, question: string | undefined, ui: Ui): Promise<number> {
   if (!store.exists(name)) {
@@ -514,10 +567,10 @@ async function cmdAsk(name: string, question: string | undefined, ui: Ui): Promi
     console.log("");
     console.log(`  built    ${agent.iterations.length} round${agent.iterations.length === 1 ? "" : "s"}, ${plebMoney(agent.costUsd)}`);
     console.log(`  checked  ${v ? (last?.verdict === "green" ? "tests pass" : "tests are failing") : C.yellow("nothing verifies this")}${agent.coverage ? C.dim(` · ${agent.coverage.pct}% of the code covered`) : ""}`);
-    console.log(`  lives in ${ws.replace(process.env.HOME ?? "", "~")}`);
+
 
     const steps: Array<[string, string]> = [
-      [`cd ${ws.replace(process.env.HOME ?? "", "~")}`, "run it yourself"],
+      [`yeet ${agent.name} test`, "run its checks and show the output"],
       [`yeet ${agent.name} "…"`, "keep building"],
       [`yeet ask ${agent.name} "why …?"`, "ask it about its own work (a few cents)"],
     ];
@@ -715,6 +768,7 @@ function help(): void {
   yeet ask <name> "why X?"       ask the agent about its work (a few cents)
   yeet <name> config             show settings · set: origin <url> · test "<cmd>" ·
                                  coverage "<cmd>" · model <p/m>
+  yeet <name> test               run its checks in a sandbox and show the output
   yeet <name> push               push its branch to the configured origin (asks first)
   yeet rm <name>                 delete an agent, workspace and all
   yeet config smarty on|off      dev detail always · model <p/m> sets the default
@@ -786,6 +840,7 @@ async function main(): Promise<number> {
     }
     if (rest[1] === "config") return cmdAgentConfig(agent, rest.slice(2), ui);
     if (rest[1] === "push") return cmdPush(agent, ui);
+    if (rest[1] === "test") return cmdTest(agent.name, ui);
     if (rest.length >= 2) return runAgentLoop(agent, flags, ui, rest.slice(1).join(" "));
 
     ui.event({

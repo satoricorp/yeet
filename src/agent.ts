@@ -83,7 +83,7 @@ export type Agent = {
   iterations: IterationRecord[];
 };
 
-export const RESERVED = new Set(["ls", "help", "ask", "rm", "config", "push", "-h", "--help"]);
+export const RESERVED = new Set(["ls", "help", "ask", "rm", "config", "push", "test", "-h", "--help"]);
 
 /** Names double as directory names and git branch names, so they get the same cleaning
  *  whether they came from slugify or from --name. */

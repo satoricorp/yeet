@@ -61,7 +61,7 @@ export function ulid(now = Date.now()): string {
 export type Outcome = "edited" | "no_edit" | "error" | "stopped";
 export type StoppedBy = "budget" | "stall" | null;
 export type Status = "running" | "passed" | "stalled" | "capped" | "failed" | "unverified";
-export type VerifyReason = "baseline" | "confirm" | "coverage";
+export type VerifyReason = "baseline" | "confirm" | "coverage" | "manual";
 export type MergeResult = "clean" | "conflicted" | "resolved" | "aborted";
 
 /** What the agent did to the code during one iteration. `commit` is null when nothing changed —
