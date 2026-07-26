@@ -21,7 +21,12 @@ import { join } from "node:path";
  *  iteration as infrastructure failure rather than trusting a partial result. */
 const SAFE_VALUE = /^[A-Za-z0-9._:/+=-]*$/;
 
-export type Phase = "baseline" | "agent" | "confirm" | "ablation";
+/**
+ * chat: the agent talks (yeet ask), and the runner discards any file changes after.
+ * coverage: run a coverage command in test-cmd.sh's slot; no agent, no commit, no cleanup —
+ * the host reads the lcov artifact off the shared workspace afterwards.
+ */
+export type Phase = "baseline" | "agent" | "confirm" | "chat" | "coverage";
 
 export type IterationRequest = {
   runId: string;
@@ -33,8 +38,6 @@ export type IterationRequest = {
   /** Guest-absolute. Empty on the first attempt; a populated dir makes pi resume with -c. */
   sessionDir: string;
   baseHead: string;
-  agentTimeoutS: number;
-  testTimeoutS: number;
   /** Free text — written to prompt.txt, never passed as argv or env. */
   prompt?: string;
   commitMessage?: string;
@@ -47,8 +50,11 @@ export type Meta = Record<string, string>;
 /** Write everything the in-guest runner needs. Paths handed to the guest are guest-absolute
  *  (/yeet/...), never host paths — the guest has no notion of where the host mounted this. */
 export function writeRequest(iterDir: string, guestIterDir: string, req: IterationRequest): void {
+  // No timeout values cross the wire anymore: liveness is the CLI controller's job. It watches
+  // the shared mount for activity and kills the VM itself — a fuse inside the guest can't know
+  // that a human is mid-answer on a question, and the controller can.
   const env = [
-    "YEET_SCHEMA=yeet.request/1",
+    "YEET_SCHEMA=yeet.request/2",
     `YEET_RUN_ID=${req.runId}`,
     `YEET_ITER=${String(req.iteration).padStart(3, "0")}`,
     `YEET_DIR=${guestIterDir}`,
@@ -59,8 +65,6 @@ export function writeRequest(iterDir: string, guestIterDir: string, req: Iterati
     `YEET_MODEL=${req.model}`,
     `YEET_SESSION_DIR=${req.sessionDir}`,
     `YEET_BASE_HEAD=${req.baseHead}`,
-    `YEET_AGENT_TIMEOUT_S=${req.agentTimeoutS}`,
-    `YEET_TEST_TIMEOUT_S=${req.testTimeoutS}`,
   ].join("\n");
   writeFileSync(join(iterDir, "request.env"), env + "\n", { mode: 0o600 });
 

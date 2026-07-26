@@ -14,6 +14,12 @@
 # nonzero launcher exit unambiguously an infrastructure failure, which is what lets the host
 # tell "the agent failed" (a result) from "the VM failed" (a retry).
 #
+# There are deliberately NO timeouts in here. Liveness is the CLI controller's call: it
+# watches the shared mount for signs of life and (1) drops a STOP file to end the agent
+# gracefully — budget hit, or wedged — then (2) kills the VM only if even that is ignored.
+# A fuse inside the guest cannot know that a human is mid-answer on an ask_user question;
+# the controller can.
+#
 # bash, not sh: /bin/sh is dash here, and this needs arrays and reliable pipefail.
 set -uo pipefail
 
@@ -22,6 +28,10 @@ set -uo pipefail
 # iterations via a fixed mutable path.
 : "${YEET_DIR:?YEET_DIR must be set by the launcher}"
 . "$YEET_DIR/request.env"
+
+# /yeet/bin first: it holds this run's staged tools, and in the no-LLM roundtrip tests it
+# holds a fake `pi`, which is what lets the whole machine be proven without spending a token.
+export PATH="/yeet/bin:$PATH"
 
 # The provider key lives in an agent-level 0600 file inside a 0700 dir, sourced but never
 # echoed. It is deliberately not in request.env (which is per-iteration and gets read for
@@ -59,7 +69,7 @@ AGENT_EXIT=""
 if [ "$YEET_RUN_AGENT" = "1" ]; then
   export PI_CODING_AGENT_SESSION_DIR="$YEET_SESSION_DIR"
   export PI_OFFLINE=1 PI_SKIP_VERSION_CHECK=1
-  mkdir -p "$YEET_SESSION_DIR"
+  mkdir -p "$YEET_SESSION_DIR" "$D/qa"
 
   # Resume deterministically: pass -c only when a session file actually exists, rather than
   # relying on -c failing gracefully on an empty dir.
@@ -74,18 +84,22 @@ if [ "$YEET_RUN_AGENT" = "1" ]; then
   # Redirect, never pipe: `pi ... | tee` discards pi's exit code (a pipeline's status is the
   # last command's, and tee always succeeds) — that is the spike's fabricated success signal.
   # stdin from /dev/null because pi -p otherwise blocks on the libkrun console device.
-  timeout -k 10 "$YEET_AGENT_TIMEOUT_S" \
-    pi -p "$(cat "$D/prompt.txt")" --model "$YEET_MODEL" -a $RESUME \
+  # -e loads yeet's own tools (ask_user, set_verify) — see guest/yeet-tools.ts.
+  pi -p "$(cat "$D/prompt.txt")" --model "$YEET_MODEL" -a $RESUME \
+    -e /yeet/bin/yeet-tools.ts \
     > "$D/agent.log" 2>&1 < /dev/null &
   PI_PID=$!
 
-  # Budget watchdog. The host tails pi's session JSONL (which is on the shared mount) and
-  # sums usage.cost.total; when the cap is crossed it drops a STOP file here. We do the
-  # killing rather than the host killing the VM, because a VM kill would lose this iteration's
-  # commit entirely — whereas stopping pi lets the runner continue normally: squash-commit the
-  # partial work, run the verifier, write meta.kv and DONE. Same reason the cost maths lives on
-  # the host: this guest has no jq and no python3.
-  ( while kill -0 "$PI_PID" 2>/dev/null; do
+  # STOP watchdog. The controller drops a STOP file when the budget cap is crossed or the
+  # guest has shown no signs of life. We do the killing rather than the host killing the VM,
+  # because a VM kill would lose this iteration's commit entirely — whereas stopping pi lets
+  # the runner continue normally: squash-commit the partial work, run the verifier, write
+  # meta.kv and DONE. The file's content is the controller's reason; we only presence-check.
+  # set +x in the subshell: with tracing on, this loop would write to runner.log every 2s,
+  # which the controller's liveness watch would read as "signs of life" — a watchdog that
+  # accidentally defeats stall detection by existing.
+  ( set +x
+    while kill -0 "$PI_PID" 2>/dev/null; do
       if [ -f "$D/STOP" ]; then
         kill -TERM "$PI_PID" 2>/dev/null
         sleep 3
@@ -100,10 +114,9 @@ if [ "$YEET_RUN_AGENT" = "1" ]; then
   AGENT_EXIT=$?
   kill "$WATCHDOG_PID" 2>/dev/null
   A1=$(date +%s)
-  [ -f "$D/STOP" ] && meta stoppedByBudget 1
+  [ -f "$D/STOP" ] && meta stopRequested 1
 
   meta agentExit    "$AGENT_EXIT"
-  meta agentTimedOut "$([ "$AGENT_EXIT" = "124" ] && echo 1 || echo 0)"
   meta agentSeconds "$((A1 - A0))"
 
   SESSION_FILE=$(find "$YEET_SESSION_DIR" -name '*.jsonl' -type f 2>/dev/null | head -1)
@@ -112,13 +125,22 @@ else
   meta agentRan 0
 fi
 
+# ── chat leaves no fingerprints ─────────────────────────────────────────────────────────
+# `yeet ask` is a conversation, not a work order. Whatever the agent touched while thinking
+# out loud gets discarded so a question can never mutate the workspace.
+if [ "$YEET_PHASE" = "chat" ]; then
+  git checkout -q -- . 2>/dev/null || true
+  git clean -qfd 2>/dev/null || true
+fi
+
 # ── commit ──────────────────────────────────────────────────────────────────────────────
-# Exactly one commit per iteration, whatever the agent did. --soft keeps the tree
-# byte-identical while collapsing any commits the agent made on its own, so "the agent
-# committed even though we told it not to" is a non-event rather than a corrupted history.
+# Exactly one commit per iteration, and ONLY in the agent phase — chat discards above, and
+# every other phase runs no agent. --soft keeps the tree byte-identical while collapsing any
+# commits the agent made on its own, so "the agent committed even though we told it not to"
+# is a non-event rather than a corrupted history.
 COMMITTED=0
 DIVERGED=0
-if [ "$YEET_RUN_AGENT" = "1" ] && [ -n "$BEFORE_HEAD" ]; then
+if [ "$YEET_PHASE" = "agent" ] && [ -n "$BEFORE_HEAD" ]; then
   if git merge-base --is-ancestor "$BEFORE_HEAD" HEAD 2>/dev/null; then
     git reset --soft "$BEFORE_HEAD"
   else
@@ -147,16 +169,17 @@ git diff --name-only -z "$BEFORE_HEAD" HEAD > "$D/changed.z" 2>/dev/null || : > 
 git diff --shortstat "$BEFORE_HEAD" HEAD > "$D/diffstat.txt" 2>/dev/null || : > "$D/diffstat.txt"
 
 # ── verify ──────────────────────────────────────────────────────────────────────────────
+# In the coverage phase, test-cmd.sh holds the coverage command — same slot, same rules.
+# No timeout: a hung verify shows up to the controller as test.log going quiet, and killing
+# the VM at that point loses nothing (the commit above is already durable on the mount).
 if [ "$YEET_RUN_TEST" = "1" ] && [ -f "$D/test-cmd.sh" ]; then
   T0=$(date +%s)
   # Redirect (not pipe) for the exit code, and </dev/null so a runner that reads stdin cannot
-  # block on the console device until the timeout.
-  timeout -k 10 "$YEET_TEST_TIMEOUT_S" bash "$D/test-cmd.sh" \
-    > "$D/test.log" 2>&1 < /dev/null
+  # block on the console device forever.
+  bash "$D/test-cmd.sh" > "$D/test.log" 2>&1 < /dev/null
   TEST_EXIT=$?
   T1=$(date +%s)
   meta testExit     "$TEST_EXIT"
-  meta testTimedOut "$([ "$TEST_EXIT" = "124" ] && echo 1 || echo 0)"
   meta testSeconds  "$((T1 - T0))"
   meta testLogSha256 "$(sha256sum "$D/test.log" 2>/dev/null | cut -c1-16)"
   meta testLogBytes  "$(wc -c < "$D/test.log" | tr -d ' ')"

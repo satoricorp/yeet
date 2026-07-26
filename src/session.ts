@@ -100,14 +100,31 @@ export function readSession(file: string | null): SessionStats {
 }
 
 /** Did the agent actually do anything? Derived from three independent signals rather than
- *  from reading prose: the tree changed, tools were called, and the process exited cleanly. */
+ *  from reading prose: the tree changed, tools were called, and the process exited cleanly.
+ *  "stopped" means the controller asked it to stop (budget or stall) — the exit code is the
+ *  SIGTERM the watchdog sent, not an agent failure. */
 export function agentVerdict(
   stats: SessionStats,
   treeChanged: boolean,
   agentExit: number,
-  timedOut: boolean,
-): "edited" | "no_edit" | "error" | "timeout" {
-  if (timedOut) return "timeout";
+  stopped: boolean,
+): "edited" | "no_edit" | "error" | "stopped" {
+  if (stopped) return "stopped";
   if (agentExit !== 0) return "error";
   return treeChanged ? "edited" : "no_edit";
+}
+
+/**
+ * Incremental cost of one iteration. `pi -c` APPENDS to the same session file (sessions.md:
+ * continue -> "Same session file"), so readSession() returns cumulative-for-the-file totals —
+ * adding those per iteration double-counts every earlier iteration. Diff against the previous
+ * reading of the same file; a new file starts its own base.
+ */
+export function costDelta(
+  prev: { file: string | null; costUsd: number } | null,
+  cur: SessionStats,
+): number {
+  if (!cur.file) return 0;
+  if (prev && prev.file === cur.file) return Math.max(0, cur.costUsd - prev.costUsd);
+  return cur.costUsd;
 }

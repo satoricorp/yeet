@@ -4,19 +4,33 @@
  * Two things the spike got wrong, both on the same line
  * (`spawnSync(AGENT_BIN, [...], {stdio: ["ignore","inherit","ignore"]})`):
  *
- *   * No timeout — a wedged guest hangs the host forever.
+ *   * No liveness control — a wedged guest hangs the host forever.
  *   * stderr discarded — libkrun's own failures (missing DYLD_LIBRARY_PATH, entitlement
  *     problems, bad config) become invisible, which is precisely the class of failure you
  *     most need to see.
+ *
+ * Liveness is a controller decision, not a fuse. The caller attaches a watcher (bridge.ts)
+ * that observes the shared mount — session growth, log growth, questions waiting on a human —
+ * and escalates on its own judgment: first a STOP file the guest honors gracefully (the
+ * runner commits partial work and writes DONE), then, only if that is ignored, the kill
+ * function handed to it here. timeoutMs stays as an absolute backstop for a guest that fools
+ * the watcher by looking alive (e.g. spinning in a log-writing loop) without ever finishing.
  */
-import { createWriteStream, writeFileSync } from "node:fs";
+import { createWriteStream } from "node:fs";
 import { LAUNCHER, launcherEnv } from "./host";
 
 export type VmOutcome =
   | { kind: "ok"; exitCode: number }
   | { kind: "launcher_config"; exitCode: 64 }
   | { kind: "guest_init"; exitCode: 125 | 126 | 127; reason: string }
+  | { kind: "killed"; why: string; afterMs: number }
   | { kind: "timeout"; afterMs: number };
+
+/** Implemented by bridge.Bridge. start() receives the trigger that destroys the VM. */
+export type VmWatcher = {
+  start(kill: (why: string) => void): void;
+  stop(): void;
+};
 
 export type VmOptions = {
   root: string;
@@ -29,12 +43,9 @@ export type VmOptions = {
   consolePath?: string;
   /** Launcher stderr — libkrun device chatter plus any real setup failure. */
   stderrPath: string;
+  /** Absolute backstop only; real liveness decisions belong to the watcher. */
   timeoutMs: number;
-  /** Polled while the VM runs. Returning true drops the STOP sentinel, which the in-guest
-   *  watchdog turns into a SIGTERM for the agent. Used to enforce the cost cap *during* an
-   *  iteration — checking only between iterations lets one long run overrun the cap without
-   *  limit (measured: $1.15 spent against a $1.00 cap). */
-  budget?: { check: () => boolean; stopFile: string; intervalMs?: number };
+  watcher?: VmWatcher;
 };
 
 /** libkrun reserves these for its in-guest init; documented at libkrun.h:1377. Because our
@@ -69,35 +80,26 @@ export async function runVM(opts: VmOptions, argv: string[]): Promise<VmOutcome>
     for await (const chunk of proc.stderr as ReadableStream<Uint8Array>) stderr.write(chunk);
   })();
 
+  let killedWhy: string | null = null;
   let timedOut = false;
   const timer = setTimeout(() => {
     timedOut = true;
-    proc.kill(9); // the backstop for a wedged guest; in-guest `timeout` handles the soft cases
+    proc.kill(9);
   }, opts.timeoutMs);
 
-  // Ask the guest to stop rather than killing the VM: a kill would discard this iteration's
-  // commit, losing every minute of work the agent had already done.
-  let budgetTimer: ReturnType<typeof setInterval> | undefined;
-  if (opts.budget) {
-    const { check, stopFile, intervalMs = 3000 } = opts.budget;
-    budgetTimer = setInterval(() => {
-      try {
-        if (check()) {
-          writeFileSync(stopFile, "");
-          clearInterval(budgetTimer);
-        }
-      } catch {
-        /* a torn session file mid-write is expected; try again next tick */
-      }
-    }, intervalMs);
-  }
+  opts.watcher?.start((why) => {
+    if (killedWhy || timedOut) return;
+    killedWhy = why;
+    proc.kill(9);
+  });
 
   const exitCode = await proc.exited;
   clearTimeout(timer);
-  if (budgetTimer) clearInterval(budgetTimer);
+  opts.watcher?.stop();
   await pump.catch(() => {});
   stderr.end();
 
+  if (killedWhy) return { kind: "killed", why: killedWhy, afterMs: Date.now() - started };
   if (timedOut) return { kind: "timeout", afterMs: Date.now() - started };
   if (exitCode === 64) return { kind: "launcher_config", exitCode: 64 };
   if (exitCode in GUEST_INIT_FAILURES) {
