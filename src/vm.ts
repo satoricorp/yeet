@@ -9,7 +9,7 @@
  *     problems, bad config) become invisible, which is precisely the class of failure you
  *     most need to see.
  */
-import { createWriteStream } from "node:fs";
+import { createWriteStream, writeFileSync } from "node:fs";
 import { LAUNCHER, launcherEnv } from "./host";
 
 export type VmOutcome =
@@ -30,6 +30,11 @@ export type VmOptions = {
   /** Launcher stderr — libkrun device chatter plus any real setup failure. */
   stderrPath: string;
   timeoutMs: number;
+  /** Polled while the VM runs. Returning true drops the STOP sentinel, which the in-guest
+   *  watchdog turns into a SIGTERM for the agent. Used to enforce the cost cap *during* an
+   *  iteration — checking only between iterations lets one long run overrun the cap without
+   *  limit (measured: $1.15 spent against a $1.00 cap). */
+  budget?: { check: () => boolean; stopFile: string; intervalMs?: number };
 };
 
 /** libkrun reserves these for its in-guest init; documented at libkrun.h:1377. Because our
@@ -70,8 +75,26 @@ export async function runVM(opts: VmOptions, argv: string[]): Promise<VmOutcome>
     proc.kill(9); // the backstop for a wedged guest; in-guest `timeout` handles the soft cases
   }, opts.timeoutMs);
 
+  // Ask the guest to stop rather than killing the VM: a kill would discard this iteration's
+  // commit, losing every minute of work the agent had already done.
+  let budgetTimer: ReturnType<typeof setInterval> | undefined;
+  if (opts.budget) {
+    const { check, stopFile, intervalMs = 3000 } = opts.budget;
+    budgetTimer = setInterval(() => {
+      try {
+        if (check()) {
+          writeFileSync(stopFile, "");
+          clearInterval(budgetTimer);
+        }
+      } catch {
+        /* a torn session file mid-write is expected; try again next tick */
+      }
+    }, intervalMs);
+  }
+
   const exitCode = await proc.exited;
   clearTimeout(timer);
+  if (budgetTimer) clearInterval(budgetTimer);
   await pump.catch(() => {});
   stderr.end();
 

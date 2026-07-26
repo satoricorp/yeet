@@ -39,13 +39,23 @@ export type IterationResult = {
    *  "error" is materially different from "no_edit": a model that cannot emit a valid tool
    *  call will never make progress, so reporting it as a stall misdirects the user. */
   agentVerdict: "edited" | "no_edit" | "error" | "timeout" | null;
+  /** The budget watchdog stopped the agent mid-work. */
+  stoppedByBudget: boolean;
+  /** The agent was killed mid-edit (timeout or budget), so the committed tree may be
+   *  syntactically inconsistent — measured once as a file ending `export { Parser as default;`.
+   *  Keeping the partial work is right; presenting it as an ordinary red iteration is not. */
+  interrupted: boolean;
   session: SessionStats;
   verdict: "green" | "red" | "none";
 };
 
 export async function runIteration(
   agent: store.Agent,
-  opts: { n: number; phase: Phase; runAgent: boolean; runTest: boolean; prompt?: string },
+  opts: {
+    n: number; phase: Phase; runAgent: boolean; runTest: boolean; prompt?: string;
+    /** Enforced DURING the iteration, not just between iterations. */
+    budget?: { capUsd: number; spentUsd: number };
+  },
 ): Promise<IterationResult> {
   const dir = store.agentDir(agent.name);
   const iterName = `iter-${String(opts.n).padStart(3, "0")}`;
@@ -92,6 +102,18 @@ export async function runIteration(
       consolePath: join(iterDir, "console.log"),
       stderrPath: join(iterDir, "vm.stderr"),
       timeoutMs: (DEFAULT_LIMITS.agentTimeoutS + DEFAULT_LIMITS.testTimeoutS + 120) * 1000,
+      budget:
+        opts.runAgent && opts.budget
+          ? {
+              stopFile: join(iterDir, "STOP"),
+              // Read the live session file the guest is still appending to. Costs nothing —
+              // it is a host-side file read of a shared-mount path.
+              check: () => {
+                const live = readSession(findSessionFile(join(dir, "session")));
+                return opts.budget!.spentUsd + live.costUsd >= opts.budget!.capUsd;
+              },
+            }
+          : undefined,
     },
     ["/usr/local/bin/yeet-init", "/yeet/bin/yeet-run"],
   );
@@ -100,7 +122,8 @@ export async function runIteration(
   const base: IterationResult = {
     n: opts.n, phase: opts.phase, valid: false, treeChanged: false, committed: false,
     afterTree: "", insertions: 0, deletions: 0, filesChanged: 0, testExit: null, testLog: "",
-    agentSeconds: 0, agentExit: null, agentVerdict: null, session: EMPTY_SESSION, verdict: "none",
+    agentSeconds: 0, agentExit: null, agentVerdict: null, stoppedByBudget: false,
+    interrupted: false, session: EMPTY_SESSION, verdict: "none",
   };
 
   if (outcome.kind !== "ok" || !sawDone(iterDir)) {
@@ -132,6 +155,8 @@ export async function runIteration(
     agentVerdict: opts.runAgent
       ? agentVerdict(session, treeChanged, agentExit ?? -1, bool(meta, "agentTimedOut"))
       : null,
+    stoppedByBudget: bool(meta, "stoppedByBudget"),
+    interrupted: bool(meta, "agentTimedOut") || bool(meta, "stoppedByBudget"),
     treeChanged,
     committed: bool(meta, "committed"),
     afterTree: meta.afterTree ?? "",

@@ -76,9 +76,31 @@ if [ "$YEET_RUN_AGENT" = "1" ]; then
   # stdin from /dev/null because pi -p otherwise blocks on the libkrun console device.
   timeout -k 10 "$YEET_AGENT_TIMEOUT_S" \
     pi -p "$(cat "$D/prompt.txt")" --model "$YEET_MODEL" -a $RESUME \
-    > "$D/agent.log" 2>&1 < /dev/null
+    > "$D/agent.log" 2>&1 < /dev/null &
+  PI_PID=$!
+
+  # Budget watchdog. The host tails pi's session JSONL (which is on the shared mount) and
+  # sums usage.cost.total; when the cap is crossed it drops a STOP file here. We do the
+  # killing rather than the host killing the VM, because a VM kill would lose this iteration's
+  # commit entirely — whereas stopping pi lets the runner continue normally: squash-commit the
+  # partial work, run the verifier, write meta.kv and DONE. Same reason the cost maths lives on
+  # the host: this guest has no jq and no python3.
+  ( while kill -0 "$PI_PID" 2>/dev/null; do
+      if [ -f "$D/STOP" ]; then
+        kill -TERM "$PI_PID" 2>/dev/null
+        sleep 3
+        kill -KILL "$PI_PID" 2>/dev/null
+        break
+      fi
+      sleep 2
+    done ) &
+  WATCHDOG_PID=$!
+
+  wait "$PI_PID"
   AGENT_EXIT=$?
+  kill "$WATCHDOG_PID" 2>/dev/null
   A1=$(date +%s)
+  [ -f "$D/STOP" ] && meta stoppedByBudget 1
 
   meta agentExit    "$AGENT_EXIT"
   meta agentTimedOut "$([ "$AGENT_EXIT" = "124" ] && echo 1 || echo 0)"
