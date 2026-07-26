@@ -57,7 +57,8 @@ export function ulid(now = Date.now()): string {
 
 // ── event shapes ──────────────────────────────────────────────────────────────────────────
 
-export type Outcome = "edited" | "no_change" | "error" | "stopped";
+/** Matches `agentVerdict` in session.ts — one vocabulary, not two that drift. */
+export type Outcome = "edited" | "no_edit" | "error" | "stopped";
 export type StoppedBy = "budget" | "stall" | null;
 export type Status = "running" | "passed" | "stalled" | "capped" | "failed" | "unverified";
 export type VerifyReason = "baseline" | "confirm" | "coverage";
@@ -81,11 +82,25 @@ export type GitChange = {
 export type VerifyRun = { command: string; exitCode: number; passed: boolean };
 
 export type EventBody =
-  | { kind: "created"; name: string; userPrompt: string; model: string;
+  /** `agentId` is the stable identity. The name is a handle and `rename` changes it, so keying
+   *  anything durable on the name would break the moment someone renames an agent — and would
+   *  make two machines disagree about which agent they are talking about. */
+  | { kind: "created"; agentId: string; name: string; userPrompt: string; model: string;
       session: { program: string; file: string };
       git: { branch: string; baseCommit: string | null; origin: string | null } }
   | { kind: "prompt"; from: "user" | "agent"; text: string }
-  | { kind: "config"; key: "origin" | "target" | "model"; value: string | null; setBy: "user" | "agent" }
+  /** `baseCommit` is present only when setting an origin also imported it as the new base,
+   *  which happens for a pristine agent. The two facts always occur together, so splitting
+   *  them into separate events would imply an ordering that does not exist. */
+  | { kind: "config"; key: "origin" | "target" | "model"; value: string | null;
+      setBy: "user" | "agent"; baseCommit?: string }
+  | { kind: "renamed"; from: string; to: string; branch: string }
+  /** Measured once, after a confirmed pass — the number that makes a green light worth
+   *  believing. Separate from verify_run because it is a property of the agent, not of a run. */
+  | { kind: "coverage"; pct: number; coveredLines: number; totalLines: number }
+  /** `yeet ask <name> "…"` spends money without producing an iteration. Without this the cost
+   *  total silently under-reports. */
+  | { kind: "chat"; question: string; costUsd: number }
   | { kind: "verify_set"; command: string; testFiles: string[]; coverageCommand: string | null;
       proposedBy: "agent" | "user"; approvedBy: "user" | "auto"; changedOnApproval: boolean;
       protectedTests: Record<string, string> }
@@ -149,16 +164,35 @@ export class FileEventStore implements EventStore {
   }
 }
 
+/** The process-wide log. Swapping this for a Postgres-backed store is the entire cloud port —
+ *  every caller below goes through `record`, and none of them know which store they have. */
+export const log: EventStore = new FileEventStore();
+
+/** Append one event. Recording must never take down a run: a failed append costs history, but
+ *  throwing here would cost the work itself, which is strictly worse. */
+export function record(agent: string, body: EventBody): AgentEvent | null {
+  try {
+    return log.append(agent, [body])[0] ?? null;
+  } catch (e) {
+    console.error(`yeet: could not record ${body.kind} for ${agent}: ${(e as Error).message}`);
+    return null;
+  }
+}
+
 // ── the fold ──────────────────────────────────────────────────────────────────────────────
 
 export type Checkpoint = { id: string; commit: string; sessionEnd: number };
 
 export type AgentState = {
+  /** Stable across renames and across machines. The name is only a handle. */
+  id: string;
   name: string;
   userPrompt: string;
   model: string;
   status: Status;
+  /** Every dollar spent: iterations and chat both. */
   costUsd: number;
+  coverage: { pct: number; coveredLines: number; totalLines: number } | null;
   git: { branch: string; baseCommit: string | null; origin: string | null; target: string };
   session: { program: string; file: string } | null;
   verify: {
@@ -180,11 +214,13 @@ export function fold(events: AgentEvent[]): AgentState | null {
   if (!created || created.kind !== "created") return null;
 
   const state: AgentState = {
+    id: created.agentId,
     name: created.name,
     userPrompt: created.userPrompt,
     model: created.model,
     status: "running",
     costUsd: 0,
+    coverage: null,
     git: { ...created.git, target: "main" },
     session: created.session,
     verify: null,
@@ -200,6 +236,18 @@ export function fold(events: AgentEvent[]): AgentState | null {
         if (e.key === "model" && e.value) state.model = e.value;
         else if (e.key === "origin") state.git.origin = e.value;
         else if (e.key === "target" && e.value) state.git.target = e.value;
+        // Setting an origin on a pristine agent also imports it as the new base.
+        if (e.baseCommit) state.git.baseCommit = e.baseCommit;
+        break;
+      case "renamed":
+        state.name = e.to;
+        state.git.branch = e.branch;
+        break;
+      case "coverage":
+        state.coverage = { pct: e.pct, coveredLines: e.coveredLines, totalLines: e.totalLines };
+        break;
+      case "chat":
+        state.costUsd += e.costUsd;
         break;
       case "verify_set":
         state.verify = {

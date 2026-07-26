@@ -148,7 +148,7 @@ A failure — the real $1.15 overrun that motivated the budget watchdog:
 mid-edit* — the committed tree may not even parse. That is a different fact from "the agent
 finished and the tests failed", and it has to read differently.
 
-- `outcome`: `edited` · `no_change` · `error` · `stopped`
+- `outcome`: `edited` · `no_edit` · `error` · `stopped`
 - `stoppedBy`: `budget` · `stall` · `null`
 - `sessionEnd`: transcript position after this iteration. 1034 against 47 is thrashing, as a number.
 - `git.commit` is `null` when nothing changed — there are no empty commits, so absence is signal.
