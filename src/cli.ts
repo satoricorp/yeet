@@ -188,16 +188,18 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, followUp?: string)
 function cmdLs() {
   const agents = store.list();
   if (agents.length === 0) { console.log("no agents yet"); return; }
-  console.log(C.dim("NAME".padEnd(20) + "STATE".padEnd(10) + "ITER".padEnd(6) + "COST".padEnd(8) + "WHERE".padEnd(16) + "LAST"));
+  console.log(C.dim("NAME".padEnd(24) + "STATE".padEnd(10) + "ITER".padEnd(6) + "COST".padEnd(10) + "WHERE".padEnd(16) + "LAST"));
   for (const a of agents) {
     const last = a.iterations.at(-1);
     const summary = last
       ? `${last.verdict === "green" ? "green" : last.verdict === "red" ? `red (exit ${last.testExit})` : "ran"}, +${last.insertions} −${last.deletions}`
       : a.task.slice(0, 40);
-    const state = a.state === "passed" ? C.green(a.state) : a.state === "running" ? C.cyan(a.state) : C.yellow(a.state);
+    // Pad the PLAIN text, then colour it. padEnd() counts ANSI escape bytes as width, so
+    // colouring first silently breaks every column to its right.
+    const paint = a.state === "passed" ? C.green : a.state === "running" ? C.cyan : C.yellow;
     console.log(
-      a.name.padEnd(20) + state.padEnd(19) + String(a.iterations.length).padEnd(6) +
-      usd(a.costUsd).padEnd(8) + store.label(a).slice(0, 15).padEnd(16) + summary,
+      a.name.padEnd(24) + paint(a.state.padEnd(10)) + String(a.iterations.length).padEnd(6) +
+      usd(a.costUsd).padEnd(10) + store.label(a).slice(0, 15).padEnd(16) + summary,
     );
   }
 }
