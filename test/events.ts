@@ -96,7 +96,7 @@ console.log("\n\x1b[36m▪\x1b[0m fold");
       verify: { command: "bun test", exitCode: 1, passed: false } },
     // No commit: the agent changed nothing, so this must NOT move the checkpoint.
     { kind: "iteration", n: 2,
-      agent: { seconds: 12, costUsd: 0.03, outcome: "no_change", stoppedBy: null, sessionEnd: 61 },
+      agent: { seconds: 12, costUsd: 0.03, outcome: "no_edit", stoppedBy: null, sessionEnd: 61 },
       git: { commit: null, filesChanged: 0, linesAdded: 0, linesRemoved: 0, protectedTestsChanged: [] },
       verify: { command: "bun test", exitCode: 1, passed: false } },
     { kind: "status", status: "stalled", reason: "no progress for 2 iterations" },

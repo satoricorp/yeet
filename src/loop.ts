@@ -21,6 +21,7 @@ import { runVM } from "./vm";
 import { Bridge, prepareQaDir, type AskRequest, type VerifyRequest, type VerifyDecision } from "./bridge";
 import { findSessionFile, readSession, agentVerdict, costDelta, EMPTY_SESSION, type SessionStats } from "./session";
 import { bridgeKey, describeMissingKey } from "./keys";
+import { record } from "./events";
 import { findLcov, parseLcov, type Coverage } from "./coverage";
 import * as store from "./agent";
 
@@ -40,7 +41,9 @@ export const DEFAULT_LIMITS: Limits = {
  *  answers. Everything is async because a human may be on the other end. */
 export type IterationIo = {
   ask(q: AskRequest): Promise<string>;
-  verifyProposal(v: VerifyRequest): Promise<VerifyDecision>;
+  /** The extra fields are what make the audit trail meaningful: whether a human was actually
+   *  at the terminal, and whether they changed what the agent proposed. */
+  verifyProposal(v: VerifyRequest): Promise<VerifyDecision & { approvedBy?: "user" | "auto"; changedOnApproval?: boolean }>;
   escalate?(action: "stop" | "kill", reason: "budget" | "stall"): void;
 };
 
@@ -166,6 +169,16 @@ export async function runIteration(
         frozen: store.frozenTests(agent, decision.testFiles),
       };
       store.save(agent);
+      record(agent.name, {
+        kind: "verify_set",
+        command: decision.command,
+        testFiles: decision.testFiles,
+        coverageCommand: decision.coverageCommand,
+        proposedBy: "agent",
+        approvedBy: decision.approvedBy ?? "auto",
+        changedOnApproval: decision.changedOnApproval ?? false,
+        protectedTests: agent.verify.frozen,
+      });
       if (opts.runTest) {
         writeFileSync(join(iterDir, "test-cmd.sh"), decision.command + "\n", { mode: 0o700 });
       }

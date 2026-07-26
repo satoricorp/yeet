@@ -29,6 +29,7 @@ import {
 import { Ui, C, usd, dur, type Mode } from "./ui";
 import { loadConfig, saveConfig, DEFAULT_MODEL } from "./config";
 import { costDelta, findSessionFile, readSession } from "./session";
+import { record } from "./events";
 import { reviewWorkspace } from "./review";
 
 const EXIT = { passed: 0, usage: 1, stalled: 2, capped: 3, failed: 4, unverified: 5 } as const;
@@ -85,7 +86,10 @@ function ioFor(ui: Ui): IterationIo {
     ask: async (q) => (await ui.ask(q)).answer,
     verifyProposal: async (v) => {
       const d = await ui.verifyProposal(v);
-      return { command: d.command, testFiles: d.testFiles, coverageCommand: d.coverageCommand };
+      return {
+        command: d.command, testFiles: d.testFiles, coverageCommand: d.coverageCommand,
+        approvedBy: ui.autoAnswer ? "auto" : "user", changedOnApproval: d.edited,
+      };
     },
     escalate: (action, reason) => ui.event({ event: "escalate", action, reason }),
   };
@@ -125,6 +129,9 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
     if (ui.autoAnswer && ui.mode !== "json" && !process.stdin.isTTY) {
       ui.event({ event: "info", message: "no terminal to ask questions on — taking the agent's recommendations" });
     }
+    // The first instruction is on the `created` event as userPrompt; every later one needs its
+    // own. Recorded here rather than at the two call sites so it cannot be missed on one path.
+    if (followUp) record(agent.name, { kind: "prompt", from: "user", text: followUp });
 
     const io = ioFor(ui);
     const history: IterationResult[] = [];
@@ -143,6 +150,12 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
       const base = await runIteration(agent, { n: 0, phase: "baseline", runAgent: false, runTest: true });
       history.push(base);
       ui.event({ event: "baseline", verdict: base.verdict, testExit: base.testExit });
+      if (base.valid) {
+        record(agent.name, {
+          kind: "verify_run", reason: "baseline", command: agent.verify.command,
+          exitCode: base.testExit ?? -1, passed: base.verdict === "green",
+        });
+      }
       if (!base.valid) {
         ui.event({ event: "error", message: base.invalidReason ?? "infrastructure failure" });
         return EXIT.failed;
@@ -150,10 +163,12 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
       if (base.testExit === 126 || base.testExit === 127) {
         ui.event({ event: "error", message: `verify command \`${agent.verify.command}\` exits ${base.testExit} — fix it before spending tokens (yeet ${agent.name} config test "...")` });
         agent.state = "failed"; store.save(agent);
+        record(agent.name, { kind: "status", status: "failed", reason: `verify command exits ${base.testExit}` });
         return EXIT.failed;
       }
       if (base.verdict === "green") {
         agent.state = "passed"; store.save(agent);
+        record(agent.name, { kind: "status", status: "passed", reason: "already green — nothing to do" });
         ui.event({ event: "done", state: "passed", seconds: Math.round((Date.now() - started) / 1000), costUsd: agent.costUsd, note: "already green — nothing to do", branch: agent.branch, workspace: store.workspaceDir(agent.name), origin: agent.origin, summary: null, model: agent.model, coveragePct: agent.coverage?.pct ?? null });
         return EXIT.passed;
       }
@@ -218,6 +233,20 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
         stopReason: r.stopReason ?? undefined,
       });
       store.save(agent);
+      record(agent.name, {
+        kind: "iteration", n: iterN,
+        agent: {
+          seconds: r.agentSeconds, costUsd: delta,
+          outcome: r.agentVerdict ?? "no_edit", stoppedBy: r.stopReason, sessionEnd: r.session.turns,
+        },
+        git: {
+          commit: r.committed ? r.afterTree : null,
+          filesChanged: r.filesChanged, linesAdded: r.insertions, linesRemoved: r.deletions,
+          protectedTestsChanged: r.touchedFrozen,
+        },
+        verify: r.testExit === null ? null
+          : { command: agent.verify?.command ?? "", exitCode: r.testExit, passed: r.verdict === "green" },
+      });
 
       ui.event({
         event: "iteration", n: iterN, seconds: r.agentSeconds, costUsd: delta,
@@ -248,6 +277,12 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
           dirName: `confirm-${String(iterN).padStart(3, "0")}`,
         });
         ui.event({ event: "confirmed", ok: confirm.verdict === "green" });
+        if (confirm.valid) {
+          record(agent.name, {
+            kind: "verify_run", reason: "confirm", command: agent.verify?.command ?? "",
+            exitCode: confirm.testExit ?? -1, passed: confirm.verdict === "green",
+          });
+        }
         if (confirm.verdict === "green") {
           outcome = "passed";
           if (r.touchedFrozen.length > 0) {
@@ -293,6 +328,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
 
     agent.state = outcome;
     store.save(agent);
+    record(agent.name, { kind: "status", status: outcome, reason: stopNote || null });
 
     // Coverage: measured once, after a confirmed pass — a number for "how much of the app do
     // the tests actually exercise", which is what makes a green light worth believing.
@@ -301,6 +337,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
       if (cov) {
         agent.coverage = { pct: cov.pct, coveredLines: cov.coveredLines, totalLines: cov.totalLines, at: new Date().toISOString() };
         store.save(agent);
+        record(agent.name, { kind: "coverage", pct: cov.pct, coveredLines: cov.coveredLines, totalLines: cov.totalLines });
         ui.event({ event: "coverage", pct: cov.pct, coveredLines: cov.coveredLines, totalLines: cov.totalLines });
       } else {
         ui.event({ event: "coverage", pct: null, coveredLines: 0, totalLines: 0, note: "no lcov file appeared" });
@@ -416,6 +453,8 @@ async function cmdAsk(name: string, question: string | undefined, ui: Ui): Promi
     }
     agent.costUsd += res.costUsd;
     store.save(agent);
+    // Chat spends money without producing an iteration; without this the total under-reports.
+    record(agent.name, { kind: "chat", question, costUsd: res.costUsd });
     if (ui.mode === "json") {
       console.log(JSON.stringify({ event: "chat_answer", agent: name, answer: res.answer, costUsd: res.costUsd }));
     } else {
@@ -508,6 +547,11 @@ function cmdAgentConfig(agent: store.Agent, args: string[], ui: Ui): number {
         frozen: agent.verify?.frozen ?? {},
       };
       store.save(agent);
+      record(agent.name, {
+        kind: "verify_set", command: value, testFiles: agent.verify.testFiles,
+        coverageCommand: agent.verify.coverageCommand, proposedBy: "user", approvedBy: "user",
+        changedOnApproval: false, protectedTests: agent.verify.frozen,
+      });
       ui.event({ event: "info", message: `verify is now: ${value}` });
       return 0;
     }
@@ -515,6 +559,11 @@ function cmdAgentConfig(agent: store.Agent, args: string[], ui: Ui): number {
       if (!agent.verify) { ui.event({ event: "error", message: "set a test command first (config test)" }); return EXIT.usage; }
       agent.verify.coverageCommand = value || null;
       store.save(agent);
+      record(agent.name, {
+        kind: "verify_set", command: agent.verify.command, testFiles: agent.verify.testFiles,
+        coverageCommand: agent.verify.coverageCommand, proposedBy: "user", approvedBy: "user",
+        changedOnApproval: false, protectedTests: agent.verify.frozen,
+      });
       ui.event({ event: "info", message: value ? `coverage command is now: ${value}` : "coverage command cleared" });
       return 0;
     }
@@ -522,6 +571,7 @@ function cmdAgentConfig(agent: store.Agent, args: string[], ui: Ui): number {
       if (!value) { ui.event({ event: "error", message: "usage: config model <provider/model>" }); return EXIT.usage; }
       agent.model = value;
       store.save(agent);
+      record(agent.name, { kind: "config", key: "model", value, setBy: "user" });
       ui.event({ event: "info", message: `model is now: ${value}` });
       return 0;
     }
@@ -619,7 +669,11 @@ async function main(): Promise<number> {
   // yeet <existing> …
   if (rest[0] && store.exists(rest[0])) {
     const agent = store.load(rest[0]);
-    if (flags.model) { agent.model = flags.model; store.save(agent); }
+    if (flags.model) {
+      agent.model = flags.model;
+      store.save(agent);
+      record(agent.name, { kind: "config", key: "model", value: flags.model, setBy: "user" });
+    }
 
     if (flags.rename) {
       const lock = tryLock(`${store.agentDir(agent.name)}/.lock`);

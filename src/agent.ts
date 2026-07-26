@@ -22,6 +22,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { AGENTS_DIR } from "./host";
+import { record, ulid } from "./events";
 
 export type IterationRecord = {
   n: number;
@@ -59,6 +60,9 @@ export type Verify = {
 export type CoverageRecord = { pct: number; coveredLines: number; totalLines: number; at: string };
 
 export type Agent = {
+  /** Stable identity, unlike `name` which `rename` changes. Optional so agent.json files
+   *  written before the event log still load; `load()` backfills one. */
+  id?: string;
   name: string;
   createdAt: string;
   /** Legacy field from the era when yeet cloned the repo containing cwd. New agents never
@@ -124,6 +128,11 @@ export function load(name: string): Agent {
   }
   if (raw.origin === undefined) raw.origin = null;
   if (raw.coverage === undefined) raw.coverage = null;
+  // Agents that predate the event log get an identity now, so they can sync later.
+  if (!raw.id) {
+    raw.id = ulid();
+    save(raw);
+  }
   return raw;
 }
 
@@ -196,7 +205,17 @@ export function create(opts: CreateOptions): Agent {
     costUsd: 0,
     iterations: [],
   };
+  agent.id = ulid();
   save(agent);
+  record(name, {
+    kind: "created",
+    agentId: agent.id,
+    name,
+    userPrompt: opts.task,
+    model: opts.model,
+    session: { program: "pi", file: "session" },
+    git: { branch, baseCommit: baseHead, origin: null },
+  });
   return agent;
 }
 
@@ -220,6 +239,7 @@ export function setOrigin(agent: Agent, url: string): { imported: boolean; detai
 
   if (!isPristine(agent)) {
     save(agent);
+    record(agent.name, { kind: "config", key: "origin", value: url, setBy: "user" });
     return { imported: false, detail: "origin set; existing work kept (push will offer this branch)" };
   }
 
@@ -236,6 +256,9 @@ export function setOrigin(agent: Agent, url: string): { imported: boolean; detai
   git(ws, "reset", "--hard", "--quiet", target.out);
   agent.baseHead = target.out;
   save(agent);
+  // One event, not two: setting the origin and adopting it as the base happen together, and
+  // splitting them would imply an ordering between facts that were always simultaneous.
+  record(agent.name, { kind: "config", key: "origin", value: url, setBy: "user", baseCommit: target.out });
   return { imported: true, detail: `imported ${url} @ ${target.out.slice(0, 7)} as the base` };
 }
 
@@ -261,6 +284,9 @@ export function rename(agent: Agent, to: string): Agent {
   agent.name = next;
   agent.branch = `yeet/${next}`;
   save(agent);
+  // Recorded AFTER the directory move, so the event lands in the log that travelled with the
+  // agent rather than in an empty directory under the old name.
+  record(next, { kind: "renamed", from, to: next, branch: agent.branch });
   return agent;
 }
 
