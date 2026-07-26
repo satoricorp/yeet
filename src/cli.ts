@@ -118,6 +118,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, followUp?: string)
 
       const r = await runIteration(agent, {
         n: iterN, phase: "agent", runAgent: true, runTest: !!agent.testCommand, prompt,
+        budget: { capUsd: flags.maxCost, spentUsd: agent.costUsd },
       });
       history.push(r);
 
@@ -143,6 +144,13 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, followUp?: string)
             ? C.yellow("timed out")
             : C.dim("no edit");
       row(String(iterN), "agent", dur(r.agentSeconds), usd(r.session.costUsd), edits, verdictText(r));
+
+      // Killing the agent mid-edit can leave the tree syntactically inconsistent. Say so —
+      // a red result from a half-written file means something different from a red result
+      // from code the agent believed was finished.
+      if (r.interrupted && r.treeChanged) {
+        console.log(`     ${C.yellow("⚠")} ${C.dim("interrupted mid-edit — the committed tree may be inconsistent")}`);
+      }
 
       // An agent that cannot emit a valid tool call will never make progress, so retrying it
       // is spend with no expected value. Two in a row means the model, not the task, is the
@@ -171,6 +179,22 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, followUp?: string)
         continue;
       }
 
+      // Stop reasons in precedence order. A green result already returned above and beats
+      // everything. Below that, report what ACTUALLY happened rather than whichever condition
+      // happens to be checked last: a run that hit the agent timeout used to be reported as
+      // "cost cap", because the cost check ran afterwards and the overrun was a consequence,
+      // not the cause.
+      if (r.stoppedByBudget) {
+        outcome = "capped";
+        stopNote = `hit the ${usd(flags.maxCost)} cap mid-iteration — agent stopped, partial work kept`;
+        break;
+      }
+      if (r.agentVerdict === "timeout") {
+        outcome = "capped";
+        stopNote = `the agent hit its ${DEFAULT_LIMITS.agentTimeoutS}s timeout mid-work`;
+        break;
+      }
+
       // Two detectors, one strike counter. The tree SHA is git's own content hash — exact and
       // free — and it only works because artifacts live outside the workspace.
       const prevAgent = history.filter((h) => h.phase === "agent" && h.n !== r.n).at(-1);
@@ -179,6 +203,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, followUp?: string)
       else strikes = 0;
 
       if (strikes >= 2) { outcome = "stalled"; stopNote = "no progress for 2 iterations"; break; }
+      // Backstop only — the in-iteration watchdog above is what actually enforces the cap.
       if (agent.costUsd >= flags.maxCost) { outcome = "capped"; stopNote = `cost cap ${usd(flags.maxCost)}`; break; }
     }
 
