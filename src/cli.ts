@@ -146,7 +146,12 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
 
     // ── baseline: verify only, no agent, zero tokens — but only when a verify command
     // already exists (configured or from an earlier run). A fresh agent has nothing to run.
-    if (agent.verify && !followUp) {
+    // Runs whenever a verify command exists. It used to also require `!followUp`, which made it
+    // dead code: a fresh agent has verify:null (create() sets it), and every continuation passes
+    // a follow-up — so the baseline never once ran. On a continuation it is still worth the boot,
+    // because "was it already broken before I asked for more?" is exactly what you need to know
+    // to read the result.
+    if (agent.verify) {
       const base = await runIteration(agent, { n: 0, phase: "baseline", runAgent: false, runTest: true });
       history.push(base);
       ui.event({ event: "baseline", verdict: base.verdict, testExit: base.testExit });
@@ -166,7 +171,9 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
         record(agent.name, { kind: "status", status: "failed", reason: `verify command exits ${base.testExit}` });
         return EXIT.failed;
       }
-      if (base.verdict === "green") {
+      // Only a shortcut for a FIRST run. On a follow-up a green baseline just means the previous
+      // work still holds — which is the starting line for the new request, not a reason to stop.
+      if (base.verdict === "green" && !followUp) {
         agent.state = "passed"; store.save(agent);
         record(agent.name, { kind: "status", status: "passed", reason: "already green — nothing to do" });
         ui.event({ event: "done", state: "passed", seconds: Math.round((Date.now() - started) / 1000), costUsd: agent.costUsd, note: "already green — nothing to do", branch: agent.branch, workspace: store.workspaceDir(agent.name), origin: agent.origin, summary: null, model: agent.model, coveragePct: agent.coverage?.pct ?? null });
@@ -208,6 +215,14 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
       });
       history.push(r);
 
+      // Charge BEFORE the validity check. A killed or infra-failed iteration still burned
+      // tokens — the model ran, we just could not read the result — and skipping this used to
+      // lose that spend permanently: the next run re-reads prevReading from the now-larger
+      // cumulative session file, so the gap is never recoverable and the cap under-counts.
+      const delta = costDelta({ file: prevReading.file, costUsd: prevReading.costUsd }, r.session);
+      prevReading = r.session;
+      agent.costUsd += delta;
+
       if (!r.valid) {
         const killed = (r.invalidReason ?? "").startsWith("controller killed");
         if (killed) {
@@ -219,12 +234,18 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
           stopNote = r.invalidReason ?? "infrastructure failure";
           ui.event({ event: "error", message: stopNote });
         }
+        store.save(agent);
+        // A partial iteration: no commit, no verify, but real spend that must appear in the
+        // total. Recorded so `costUsd` folded from the log matches what was actually paid.
+        record(agent.name, {
+          kind: "iteration", n: iterN,
+          agent: { seconds: r.agentSeconds, costUsd: delta, outcome: "stopped", stoppedBy: r.stopReason, sessionEnd: r.session.turns },
+          git: { commit: null, filesChanged: 0, linesAdded: 0, linesRemoved: 0, protectedTestsChanged: [] },
+          verify: null,
+        });
         break;
       }
 
-      const delta = costDelta({ file: prevReading.file, costUsd: prevReading.costUsd }, r.session);
-      prevReading = r.session;
-      agent.costUsd += delta;
       agent.iterations.push({
         n: iterN, phase: "agent", agentSeconds: r.agentSeconds, costUsd: delta,
         insertions: r.insertions, deletions: r.deletions, filesChanged: r.filesChanged,
@@ -561,7 +582,9 @@ function cmdAgentConfig(agent: store.Agent, args: string[], ui: Ui): number {
       store.save(agent);
       record(agent.name, {
         kind: "verify_set", command: agent.verify.command, testFiles: agent.verify.testFiles,
-        coverageCommand: agent.verify.coverageCommand, proposedBy: "user", approvedBy: "user",
+        // Editing the coverage command does not change WHO chose the verify contract. Claiming
+        // "user" here would rewrite authorship in the log, since fold() replaces verify wholesale.
+        coverageCommand: agent.verify.coverageCommand, proposedBy: agent.verify.source, approvedBy: "user",
         changedOnApproval: false, protectedTests: agent.verify.frozen,
       });
       ui.event({ event: "info", message: value ? `coverage command is now: ${value}` : "coverage command cleared" });
