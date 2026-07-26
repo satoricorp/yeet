@@ -2,17 +2,19 @@
 /**
  * cli.ts — yeet.
  *
- *   yeet "make me an app"                  new agent (isolated; asks questions; always verifies)
- *   yeet fix-auth "now add refresh"        continue an existing agent
- *   yeet ask fix-auth                      full detail of the last run (free)
- *   yeet ask fix-auth "why that lib?"      talk to the agent about its work
- *   yeet fix-auth config origin <url>      connect a repo (import if unbuilt; enables push)
- *   yeet fix-auth test                     run its checks and show the output
- *   yeet fix-auth push                     push the branch to origin — from the host
- *   yeet ls / yeet rm <name>               list / delete
- *   yeet config smarty on                  dev detail by default
+ * Five commands, and every one of them has its own --help:
  *
- * Disambiguation stays positional, with a small reserved-word set (see agent.RESERVED).
+ *   yeet          start an agent, or give an existing one more work
+ *   yeet ls       what you have and how it went
+ *   yeet ask      what an agent did, and questions about it
+ *   yeet config   settings, global or for one agent
+ *   yeet rm       delete an agent
+ *
+ * WHICH agent is always --name. It used to be positional, which meant the parser had to guess
+ * whether "test" was a subcommand or the first word of a task. A flag cannot be ambiguous, so
+ * the guessing is gone: bare words are the task, and the only thing left that reads them as a
+ * verb is a lone "test" or "push" next to a --name.
+ *
  * Unknown --flags are hard errors: in machine mode a typo'd flag silently becoming task text
  * would be a debugging session nobody deserves.
  *
@@ -21,15 +23,16 @@
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { AGENTS_DIR, CURRENT_IMAGE, LAUNCHER, tryLock } from "./host";
+import { AGENTS_DIR, CURRENT_IMAGE, LAUNCHER, YEET_HOME, tryLock } from "./host";
 import * as store from "./agent";
 import {
   runIteration, runChat, runCoverage, firstPrompt, retryPrompt, DEFAULT_LIMITS,
   type IterationIo, type IterationResult,
 } from "./loop";
 import { Ui, C, usd, dur, type Mode } from "./ui";
-import { plainText, plebMoney, plebState } from "./voice";
-import { loadConfig, saveConfig, DEFAULT_MODEL } from "./config";
+import { plainText, plebMoney, lines } from "./voice";
+import { loadConfig, saveConfig, DEFAULT_MODEL, VOICES, type Voice } from "./config";
+import { hiddenPrompt, setKey, deleteKey, listKeys, fingerprint, KNOWN_PROVIDERS, PROVIDER_ENV } from "./secrets";
 import { costDelta, findSessionFile, readSession } from "./session";
 import { record } from "./events";
 import { checkCounts, checkCheats, implementationFiles } from "./gates";
@@ -39,8 +42,11 @@ const EXIT = { passed: 0, usage: 1, stalled: 2, capped: 3, failed: 4, unverified
 
 type Flags = {
   model: string | null;
-  maxIter: number;
-  maxCost: number;
+  /** null means "not given on the command line" — resolved against config, then defaults.
+   *  Defaulting here instead would make a config value unreachable, since there would be no
+   *  way to tell an explicit --max-cost 2 from the built-in 2. */
+  maxIter: number | null;
+  maxCost: number | null;
   smarty: boolean;
   agentMode: boolean;
   yes: boolean;
@@ -51,7 +57,7 @@ type Flags = {
 
 function parse(argv: string[]): { rest: string[]; flags: Flags } {
   const flags: Flags = {
-    model: null, maxIter: DEFAULT_LIMITS.maxIterations, maxCost: DEFAULT_LIMITS.maxCostUsd,
+    model: null, maxIter: null, maxCost: null,
     smarty: false, agentMode: false, yes: false, name: null, rename: null, review: false,
   };
   const rest: string[] = [];
@@ -72,16 +78,24 @@ function parse(argv: string[]): { rest: string[]; flags: Flags } {
       process.exit(EXIT.usage);
     } else rest.push(a);
   }
-  if (!Number.isFinite(flags.maxIter) || flags.maxIter < 1) flags.maxIter = DEFAULT_LIMITS.maxIterations;
-  if (!Number.isFinite(flags.maxCost) || flags.maxCost <= 0) flags.maxCost = DEFAULT_LIMITS.maxCostUsd;
+  if (flags.maxIter !== null && (!Number.isFinite(flags.maxIter) || flags.maxIter < 1)) flags.maxIter = null;
+  if (flags.maxCost !== null && (!Number.isFinite(flags.maxCost) || flags.maxCost <= 0)) flags.maxCost = null;
   return { rest, flags };
+}
+
+/** flag > config > built-in default. Applied in one place so the three sources cannot
+ *  disagree between the run loop and what gets reported to the user. */
+function resolveLimits(flags: Flags): void {
+  const cfg = loadConfig();
+  flags.maxIter ??= cfg.maxIterations ?? DEFAULT_LIMITS.maxIterations;
+  flags.maxCost ??= cfg.maxCostUsd ?? DEFAULT_LIMITS.maxCostUsd;
 }
 
 function makeUi(flags: Flags): Ui {
   const cfg = loadConfig();
   const mode: Mode = flags.agentMode ? "json" : flags.smarty || cfg.smarty ? "smarty" : "pleb";
   const autoAnswer = flags.agentMode || flags.yes || !process.stdin.isTTY;
-  return new Ui(mode, autoAnswer);
+  return new Ui(mode, autoAnswer, cfg.voice);
 }
 
 function ioFor(ui: Ui): IterationIo {
@@ -127,7 +141,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
       event: "start",
       agent: agent.name, task: followUp ?? agent.task, resuming: !!followUp, isNew: agent.iterations.length === 0 && !followUp,
       model: agent.model, origin: agent.origin, verify: agent.verify?.command ?? null,
-      maxIter: flags.maxIter, maxCostUsd: flags.maxCost,
+      maxIter: flags.maxIter!, maxCostUsd: flags.maxCost!,
     });
     if (ui.autoAnswer && ui.mode !== "json" && !process.stdin.isTTY) {
       ui.event({ event: "info", message: "no terminal to ask questions on — taking the agent's recommendations" });
@@ -169,7 +183,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
         return EXIT.failed;
       }
       if (base.testExit === 126 || base.testExit === 127) {
-        ui.event({ event: "error", message: `verify command \`${agent.verify.command}\` exits ${base.testExit} — fix it before spending tokens (yeet ${agent.name} config test "...")` });
+        ui.event({ event: "error", message: `verify command \`${agent.verify.command}\` exits ${base.testExit} — fix it before spending tokens (yeet config --name ${agent.name} test "...")` });
         agent.state = "failed"; store.save(agent);
         record(agent.name, { kind: "status", status: "failed", reason: `verify command exits ${base.testExit}` });
         return EXIT.failed;
@@ -185,7 +199,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
     }
 
     const baseIter = agent.iterations.length;
-    for (let n = 1; n <= flags.maxIter; n++) {
+    for (let n = 1; n <= flags.maxIter!; n++) {
       const iterN = baseIter + n;
       const dirName = `iter-${String(iterN).padStart(3, "0")}`;
       const prev = history.filter((h) => h.phase === "agent").at(-1);
@@ -214,7 +228,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
 
       const r = await runIteration(agent, {
         n: iterN, phase: "agent", runAgent: true, runTest: true, prompt, io,
-        budget: { capUsd: flags.maxCost, spentBeforeUsd: agent.costUsd },
+        budget: { capUsd: flags.maxCost!, spentBeforeUsd: agent.costUsd },
       });
       history.push(r);
 
@@ -334,7 +348,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
       // Report what ACTUALLY happened, not whichever condition is checked last.
       if (r.stopReason === "budget") {
         outcome = "capped";
-        stopNote = `hit the ${usd(flags.maxCost)} cap mid-iteration — agent stopped, partial work kept`;
+        stopNote = `hit the ${usd(flags.maxCost!)} cap mid-iteration — agent stopped, partial work kept`;
         break;
       }
       if (r.stopReason === "stall") {
@@ -351,8 +365,8 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
       else strikes = 0;
 
       if (strikes >= 2) { outcome = "stalled"; stopNote = "no progress for 2 iterations"; break; }
-      if (agent.costUsd >= flags.maxCost) { outcome = "capped"; stopNote = `cost cap ${usd(flags.maxCost)}`; break; }
-      if (n === flags.maxIter) { outcome = "capped"; stopNote = `iteration cap (${flags.maxIter})`; }
+      if (agent.costUsd >= flags.maxCost!) { outcome = "capped"; stopNote = `cost cap ${usd(flags.maxCost!)}`; break; }
+      if (n === flags.maxIter!) { outcome = "capped"; stopNote = `iteration cap (${flags.maxIter!})`; }
     }
 
     // A run that never got a verifier is its own kind of result: maybe work happened, but
@@ -441,25 +455,28 @@ function cmdLs(ui: Ui): number {
     console.log("no agents yet — start one:  yeet \"build me something\"");
     return 0;
   }
-  console.log(C.dim("NAME".padEnd(24) + "STATE".padEnd(12) + "ITER".padEnd(6) + "COST".padEnd(10) + "WHERE".padEnd(16) + "LAST"));
+  // The name is the handle you type back into every other command, so it never gets truncated —
+  // the column grows to fit the longest one instead.
+  const w = Math.max(24, ...agents.map((a) => a.name.length + 2));
+  console.log(C.dim("NAME".padEnd(w) + "STATUS".padEnd(10) + "COST".padEnd(10) + "CHANGES"));
   for (const a of agents) {
+    // Six internal states, two words a person cares about: did it work or not. "running" stays
+    // its own word — calling a live agent "failed" would just be untrue.
+    const status = a.state === "passed" ? "good" : a.state === "running" ? "running" : "failed";
+    const paint = status === "good" ? C.green : status === "running" ? C.cyan : C.red;
     const last = a.iterations.at(-1);
-    const summary = last
-      ? `${last.verdict === "green" ? "green" : last.verdict === "red" ? `red (exit ${last.testExit})` : "ran"}, +${last.insertions} −${last.deletions}`
-      : a.task.slice(0, 40);
+    const changes = last ? `${C.green(`+${last.insertions}`)} ${C.red(`−${last.deletions}`)}` : C.dim("—");
     // Pad the PLAIN text, then colour it. padEnd() counts ANSI escape bytes as width, so
     // colouring first silently breaks every column to its right.
-    const paint = a.state === "passed" ? C.green : a.state === "running" ? C.cyan : C.yellow;
     console.log(
-      a.name.padEnd(24) + paint(a.state.padEnd(12)) + String(a.iterations.length).padEnd(6) +
-      usd(a.costUsd).padEnd(10) + store.label(a).slice(0, 15).padEnd(16) + summary,
+      a.name.padEnd(w) + paint(status.padEnd(10)) + `$${a.costUsd.toFixed(2)}`.padEnd(10) + changes,
     );
   }
   return 0;
 }
 
 /**
- * yeet <name> test — run the agent's own checks and show you the output.
+ * yeet --name <n> test — run the agent's own checks and show you the output.
  *
  * Exists because the alternative was telling people to cd into a path. Someone using yeet has
  * an agent, not a filesystem: they should never need to know there is a git repo, where it is,
@@ -502,7 +519,7 @@ async function cmdTest(name: string, ui: Ui): Promise<number> {
       for (const line of r.testLog.trimEnd().split("\n")) console.log(`  ${line}`);
       console.log("");
       console.log(r.verdict === "green" ? C.green("  all good.") : C.red(`  that is a fail (exit ${r.testExit}).`));
-      if (r.verdict !== "green") console.log(C.dim(`  tell it to fix them: yeet ${name} "the checks are failing"`));
+      if (r.verdict !== "green") console.log(C.dim(`  tell it to fix them: yeet --name ${name} "the checks are failing"`));
     }
     return r.verdict === "green" ? EXIT.passed : EXIT.failed;
   } finally {
@@ -559,7 +576,7 @@ async function cmdAsk(name: string, question: string | undefined, ui: Ui): Promi
       return 0;
     }
 
-    console.log(`${C.bold(agent.name)} — ${plebState(agent.state, agent.model)}`);
+    console.log(`${C.bold(agent.name)} — ${lines(loadConfig().voice).state(agent.state, agent.model)}`);
     console.log("");
     // The summary is where the agent says what the thing does and how to run it; the build
     // prompt asks for exactly that. Leading with it is the whole point of this command.
@@ -570,9 +587,9 @@ async function cmdAsk(name: string, question: string | undefined, ui: Ui): Promi
 
 
     const steps: Array<[string, string]> = [
-      [`yeet ${agent.name} test`, "run its checks and show the output"],
-      [`yeet ${agent.name} "…"`, "keep building"],
-      [`yeet ask ${agent.name} "why …?"`, "ask it about its own work (a few cents)"],
+      [`yeet --name ${agent.name} test`, "run its checks and show the output"],
+      [`yeet --name ${agent.name} "…"`, "keep building"],
+      [`yeet ask --name ${agent.name} "why …?"`, "ask it about its own work (a few cents)"],
     ];
     const w = Math.max(...steps.map(([c]) => c.length)) + 3;
     console.log("");
@@ -644,7 +661,7 @@ async function cmdRm(name: string, ui: Ui): Promise<number> {
 
 async function cmdPush(agent: store.Agent, ui: Ui): Promise<number> {
   if (!agent.origin) {
-    ui.event({ event: "error", message: `no origin configured — yeet ${agent.name} config origin <url>` });
+    ui.event({ event: "error", message: `no origin configured — yeet config --name ${agent.name} origin <url>` });
     return EXIT.usage;
   }
   const ok = await ui.confirm(`Push ${agent.branch} to ${agent.origin}?`);
@@ -667,8 +684,8 @@ function cmdAgentConfig(agent: store.Agent, args: string[], ui: Ui): number {
       console.log(JSON.stringify({ event: "config", agent: agent.name, origin: agent.origin, verify: agent.verify, model: agent.model }));
       return 0;
     }
-    console.log(`${C.dim("origin")}    ${agent.origin ?? "none — set one to enable push: yeet " + agent.name + " config origin <url>"}`);
-    console.log(`${C.dim("verify")}    ${agent.verify ? `${agent.verify.command} (${agent.verify.source})` : "unset — the agent registers one, or: config test \"<cmd>\""}`);
+    console.log(`${C.dim("origin")}    ${agent.origin ?? `none — set one to enable push: yeet config --name ${agent.name} origin <url>`}`);
+    console.log(`${C.dim("test")}      ${agent.verify ? `${agent.verify.command} (${agent.verify.source})` : "unset — the agent registers one, or set it yourself"}`);
     console.log(`${C.dim("coverage")}  ${agent.verify?.coverageCommand ?? "unset"}`);
     console.log(`${C.dim("model")}     ${agent.model}`);
     return 0;
@@ -678,13 +695,13 @@ function cmdAgentConfig(agent: store.Agent, args: string[], ui: Ui): number {
   const value = valueParts.join(" ");
   switch (key) {
     case "origin": {
-      if (!value) { ui.event({ event: "error", message: "usage: config origin <git-url-or-path>" }); return EXIT.usage; }
+      if (!value) { ui.event({ event: "error", message: `usage: yeet config --name ${agent.name} origin <git-url-or-path>` }); return EXIT.usage; }
       const r = store.setOrigin(agent, value);
       ui.event({ event: r.detail.startsWith("could not") ? "error" : "info", message: r.detail });
       return r.detail.startsWith("could not") ? EXIT.failed : 0;
     }
     case "test": {
-      if (!value) { ui.event({ event: "error", message: "usage: config test \"<command>\"" }); return EXIT.usage; }
+      if (!value) { ui.event({ event: "error", message: `usage: yeet config --name ${agent.name} test "<command>"` }); return EXIT.usage; }
       agent.verify = {
         command: value,
         testFiles: agent.verify?.testFiles ?? [],
@@ -702,7 +719,7 @@ function cmdAgentConfig(agent: store.Agent, args: string[], ui: Ui): number {
       return 0;
     }
     case "coverage": {
-      if (!agent.verify) { ui.event({ event: "error", message: "set a test command first (config test)" }); return EXIT.usage; }
+      if (!agent.verify) { ui.event({ event: "error", message: `set a test command first: yeet config --name ${agent.name} test "<cmd>"` }); return EXIT.usage; }
       agent.verify.coverageCommand = value || null;
       store.save(agent);
       record(agent.name, {
@@ -716,7 +733,7 @@ function cmdAgentConfig(agent: store.Agent, args: string[], ui: Ui): number {
       return 0;
     }
     case "model": {
-      if (!value) { ui.event({ event: "error", message: "usage: config model <provider/model>" }); return EXIT.usage; }
+      if (!value) { ui.event({ event: "error", message: `usage: yeet config --name ${agent.name} model <provider/model>` }); return EXIT.usage; }
       agent.model = value;
       store.save(agent);
       record(agent.name, { kind: "config", key: "model", value, setBy: "user" });
@@ -724,7 +741,7 @@ function cmdAgentConfig(agent: store.Agent, args: string[], ui: Ui): number {
       return 0;
     }
     default:
-      ui.event({ event: "error", message: `unknown config key "${key}" (origin · test · coverage · model)` });
+      ui.event({ event: "error", message: `"${key}" is not something an agent has (origin · test · coverage · model). Global settings drop the --name: see yeet config --help` });
       return EXIT.usage;
   }
 }
@@ -734,10 +751,34 @@ function cmdGlobalConfig(args: string[], ui: Ui): number {
   if (args.length === 0) {
     if (ui.mode === "json") { console.log(JSON.stringify({ event: "config", global: cfg })); return 0; }
     console.log(`${C.dim("smarty")}  ${cfg.smarty ? "on" : "off"}   ${C.dim("(dev detail by default)")}`);
+    console.log(`${C.dim("voice")}   ${cfg.voice ?? "default"}`);
     console.log(`${C.dim("model")}   ${cfg.model ?? DEFAULT_MODEL}`);
+    console.log(`${C.dim("budget")}  ${usd(cfg.maxCostUsd ?? DEFAULT_LIMITS.maxCostUsd)} ${C.dim("per run")}`);
+    console.log(`${C.dim("rounds")}  ${cfg.maxIterations ?? DEFAULT_LIMITS.maxIterations} ${C.dim("before it gives up")}`);
+    console.log(`${C.dim("origin")}  ${cfg.origin ?? C.dim("none — new agents start isolated")}`);
+    const keys = listKeys();
+    console.log(`${C.dim("keys")}    ${keys.length ? keys.map((k) => `${k.provider} ${C.dim(`(${k.where})`)}`).join(", ") : C.dim("none set — yeet config key <provider>")}`);
     return 0;
   }
   const [key, value] = args;
+  if (key === "voice") {
+    if (!VOICES.includes(value as Voice)) {
+      ui.event({ event: "error", message: `usage: yeet config voice ${VOICES.join("|")}` });
+      return EXIT.usage;
+    }
+    cfg.voice = value as Voice;
+    saveConfig(cfg);
+    // Said IN the new voice, so you hear what you just bought before you commit to it.
+    ui.event({ event: "info", message: `voice is now ${value}. ${lines(cfg.voice).passed}` });
+    return 0;
+  }
+  if (key === "origin") {
+    if (!value) { ui.event({ event: "error", message: "usage: yeet config origin <git-url-or-path>" }); return EXIT.usage; }
+    cfg.origin = value;
+    saveConfig(cfg);
+    ui.event({ event: "info", message: `new agents will start from ${value}. Existing ones keep whatever they have.` });
+    return 0;
+  }
   if (key === "smarty") {
     if (value !== "on" && value !== "off") { ui.event({ event: "error", message: "usage: yeet config smarty on|off" }); return EXIT.usage; }
     cfg.smarty = value === "on";
@@ -752,35 +793,172 @@ function cmdGlobalConfig(args: string[], ui: Ui): number {
     ui.event({ event: "info", message: `default model is now ${value}` });
     return 0;
   }
-  ui.event({ event: "error", message: `unknown config key "${key}" (smarty · model)` });
+  if (key === "budget") {
+    const n = Number(value);
+    if (!Number.isFinite(n) || n <= 0) { ui.event({ event: "error", message: "usage: yeet config budget <dollars>  e.g. yeet config budget 5" }); return EXIT.usage; }
+    cfg.maxCostUsd = n;
+    saveConfig(cfg);
+    ui.event({ event: "info", message: `budget is now ${usd(n)} per run. --max-cost still wins for a single run.` });
+    return 0;
+  }
+  if (key === "rounds") {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < 1) { ui.event({ event: "error", message: "usage: yeet config rounds <n>  e.g. yeet config rounds 8" }); return EXIT.usage; }
+    cfg.maxIterations = n;
+    saveConfig(cfg);
+    ui.event({ event: "info", message: `agents now get ${n} round${n === 1 ? "" : "s"} before I call it.` });
+    return 0;
+  }
+  ui.event({ event: "error", message: `unknown setting "${key}" — see yeet config --help` });
   return EXIT.usage;
 }
 
-function help(): void {
+/**
+ * yeet config key <provider> — read a key with no echo and store it out of reach.
+ *
+ * Deliberately NOT an argument. A key passed on the command line is in `ps` for every process
+ * on the machine and in shell history forever, and neither is undone by deleting it later.
+ */
+async function cmdKey(args: string[], ui: Ui): Promise<number> {
+  const [provider, ...rest] = args;
+  if (!provider) {
+    ui.event({ event: "error", message: `usage: yeet config key <provider> — one of ${KNOWN_PROVIDERS.join(", ")}` });
+    return EXIT.usage;
+  }
+  if (!KNOWN_PROVIDERS.includes(provider)) {
+    ui.event({ event: "error", message: `I do not know "${provider}". Try one of: ${KNOWN_PROVIDERS.join(", ")}` });
+    return EXIT.usage;
+  }
+  if (rest[0] === "remove" || rest[0] === "rm") {
+    ui.event({ event: "info", message: deleteKey(provider) ? `${provider} key removed.` : `there was no ${provider} key to remove.` });
+    return 0;
+  }
+  // A key given as an argument is already compromised — refuse rather than quietly accept it.
+  if (rest.length > 0) {
+    ui.event({ event: "error", message: `don't put the key on the command line — it lands in ps and your shell history. Run: yeet config key ${provider}` });
+    return EXIT.usage;
+  }
+  if (!process.stdin.isTTY) {
+    ui.event({ event: "error", message: `I need a terminal to take a key without echoing it. Or export ${PROVIDER_ENV[provider]} instead.` });
+    return EXIT.usage;
+  }
+
+  let value: string;
+  try {
+    value = (await hiddenPrompt(`  ${provider} key ${C.dim("(not shown as you type)")}: `)).trim();
+  } catch {
+    ui.event({ event: "info", message: "cancelled." });
+    return EXIT.usage;
+  }
+  if (!value) { ui.event({ event: "error", message: "nothing entered." }); return EXIT.usage; }
+
+  const where = setKey(provider, value);
+  ui.event({
+    event: "info",
+    message: `${provider} key saved to the ${where === "keychain" ? "macOS Keychain" : `file at ${YEET_HOME}/keys.json (0600)`}. Stored ${fingerprint(value)}.`,
+  });
+  return 0;
+}
+
+/**
+ * One screen per command, because a single wall listing every flag of every command is a
+ * reference nobody reads. `yeet --help` answers "what can this do"; `yeet <cmd> --help`
+ * answers "how do I use this one".
+ */
+function help(topic?: string): void {
   const cfg = loadConfig();
+  const model = cfg.model ?? DEFAULT_MODEL;
+  const cost = cfg.maxCostUsd ?? DEFAULT_LIMITS.maxCostUsd;
+  const iter = cfg.maxIterations ?? DEFAULT_LIMITS.maxIterations;
+
+  if (topic === "ls") {
+    console.log(`yeet ls — every agent you have, newest first.
+
+  NAME      what you call it in every other command
+  STATUS    good · failed · running
+  COST      everything it has spent: rounds and questions together
+  CHANGES   lines added and removed in its last round
+
+  --agent   JSON lines instead of the table`);
+    return;
+  }
+
+  if (topic === "ask") {
+    console.log(`yeet ask — what an agent did, and questions about it.
+
+  yeet ask --name <n>              the story of its last run. Free.
+  yeet ask --name <n> "why X?"     put the question to the agent itself. A few cents.
+
+The free version reads what yeet already recorded. The paid version wakes the agent in a
+sandbox with its own history — it can read its code, but it cannot change it.
+
+  --name <n>   required: which agent
+  --agent      JSON instead of prose`);
+    return;
+  }
+
+  if (topic === "config") {
+    console.log(`yeet config — settings. Without --name they are yours; with it, one agent's.
+
+  yeet config                       show yours
+  yeet config <setting> <value>     set one
+  yeet config --name <n>            show that agent's
+  yeet config --name <n> <s> <v>    set one on that agent
+
+yours
+  smarty on|off       developer detail everywhere, not only when you pass --smarty
+  voice ${VOICES.join("|")}
+  model <p/m>         which model new agents use              now: ${model}
+  budget <dollars>    spend ceiling for one run               now: ${usd(cost)}
+  rounds <n>          tries before yeet calls it              now: ${iter}
+  origin <url>        repo new agents start from              now: ${cfg.origin ?? "none"}
+  key <provider>      store an API key — prompts, never echoes, never an argument
+  keys                which keys are set, and where
+
+one agent's (--name)
+  origin <url>        connect a repo. Imports it as the base if nothing is built yet,
+                      and unlocks push.
+  test "<cmd>"        how the work gets proven. Overrides what the agent registered.
+  coverage "<cmd>"    must leave an lcov file behind
+  model <p/m>         just this agent
+
+Where a setting exists in both places, the agent's answer wins.`);
+    return;
+  }
+
+  if (topic === "rm") {
+    console.log(`yeet rm --name <n> — delete an agent: workspace, branch, history, all of it.
+
+Nothing is pushed first, and there is no undo. If the work matters, push it before you
+run this.
+
+  --name <n>   required: which agent
+  --yes        don't ask for confirmation`);
+    return;
+  }
+
   console.log(`yeet — sandboxed coding agents that loop until the work actually checks out
 
   yeet "build me a thing"        start a new agent. It asks questions first, proves its
                                  work with tests, and never touches your files.
-  yeet <name> "now do this"      give an existing agent a follow-up
-  yeet ls                        every agent and how it's doing
-  yeet ask <name>                the full story of its last run (free)
-  yeet ask <name> "why X?"       ask the agent about its work (a few cents)
-  yeet <name> config             show settings · set: origin <url> · test "<cmd>" ·
-                                 coverage "<cmd>" · model <p/m>
-  yeet <name> test               run its checks in a sandbox and show the output
-  yeet <name> push               push its branch to the configured origin (asks first)
-  yeet rm <name>                 delete an agent, workspace and all
-  yeet config smarty on|off      dev detail always · model <p/m> sets the default
+  yeet --name <n> "now do this"  give that agent more work
+  yeet --name <n> test           run its checks and show you the output
+  yeet --name <n> push           push its branch to origin (asks first)
 
-  --name <n>      pick the agent's name yourself (else it's made from the task)
-  --rename <new>  rename: yeet <old> --rename <new>
-  --smarty        dev detail for this run
-  --agent         machine mode: JSON lines on stdout, recommendations auto-accepted
-  --yes           don't wait for answers — take the agent's recommendations
-  --model <p/m>   default ${cfg.model ?? DEFAULT_MODEL}
-  --max-iter N    default ${DEFAULT_LIMITS.maxIterations} · --max-cost USD  default ${DEFAULT_LIMITS.maxCostUsd}
+  yeet ls                        every agent and how it went
+  yeet ask --name <n>            what one did, and questions about it
+  yeet config                    settings, yours or one agent's
+  yeet rm --name <n>             delete an agent
 
+  --name <n>       which agent. Starting a new one, this names it.
+  --rename <new>   yeet --name <old> --rename <new>
+  --model <p/m>    ${model}
+  --max-cost USD   ${cost}          --max-iter N   ${iter}
+  --smarty         developer detail for this run
+  --yes            don't wait for answers — take the agent's recommendations
+  --agent          machine mode: JSON lines on stdout, nothing else
+
+ls · ask · config · rm each have their own --help.
 exit codes: 0 passed · 1 usage/infra · 2 stalled · 3 hit a cap · 4 failed · 5 unverified`);
 }
 
@@ -788,9 +966,18 @@ exit codes: 0 passed · 1 usage/infra · 2 stalled · 3 hit a cap · 4 failed ·
 
 async function main(): Promise<number> {
   const { rest, flags } = parse(process.argv.slice(2));
+  resolveLimits(flags);
   const ui = makeUi(flags);
 
-  if (rest.length === 0 || rest[0] === "help") {
+  // `yeet ls --help`, `yeet help ls` and `yeet --help` all land here the same way: parse()
+  // turns -h/--help into a leading "help", so rest[1] is the topic when there is one.
+  if (rest[0] === "help") {
+    help(rest[1]);
+    return 0;
+  }
+  // Bare `yeet` is the help screen. `yeet --name x` is NOT — it named an agent and then asked
+  // for nothing, which is a mistake worth reporting rather than a table of contents.
+  if (rest.length === 0 && !flags.name && !flags.rename) {
     help();
     return 0;
   }
@@ -804,20 +991,52 @@ async function main(): Promise<number> {
   const cfg = loadConfig();
   const model = flags.model ?? cfg.model ?? DEFAULT_MODEL;
 
+  /** Every command but `ls` and global `config` needs to know which agent. */
+  const named = (cmd: string): store.Agent | null => {
+    if (!flags.name) {
+      ui.event({ event: "error", message: `which agent? yeet ${cmd} --name <n> — see yeet ls` });
+      return null;
+    }
+    if (!store.exists(flags.name)) {
+      ui.event({ event: "error", message: `no agent named "${flags.name}" — see yeet ls` });
+      return null;
+    }
+    return store.load(flags.name);
+  };
+
   if (rest[0] === "ls") return cmdLs(ui);
-  if (rest[0] === "config") return cmdGlobalConfig(rest.slice(1), ui);
-  if (rest[0] === "ask") {
-    if (!rest[1]) { ui.event({ event: "error", message: "usage: yeet ask <name> [\"question\"]" }); return EXIT.usage; }
-    return cmdAsk(rest[1], rest.slice(2).join(" ") || undefined, ui);
-  }
-  if (rest[0] === "rm") {
-    if (!rest[1]) { ui.event({ event: "error", message: "usage: yeet rm <name>" }); return EXIT.usage; }
-    return cmdRm(rest[1], ui);
+
+  if (rest[0] === "config") {
+    // Keys are the machine's, not an agent's, so they resolve before --name is consulted.
+    if (rest[1] === "key") return cmdKey(rest.slice(2), ui);
+    if (rest[1] === "keys") {
+      const keys = listKeys();
+      if (ui.mode === "json") { console.log(JSON.stringify({ event: "keys", keys })); return 0; }
+      // Names and locations only. Printing a value here is how a key ends up in scrollback.
+      if (!keys.length) console.log(C.dim("no keys set — yeet config key <provider>"));
+      for (const k of keys) console.log(`  ${k.provider.padEnd(12)}${C.dim(k.where === "keychain" ? "macOS Keychain" : "keys.json (0600)")}`);
+      return 0;
+    }
+    if (flags.name) {
+      const agent = named("config");
+      return agent ? cmdAgentConfig(agent, rest.slice(1), ui) : EXIT.usage;
+    }
+    return cmdGlobalConfig(rest.slice(1), ui);
   }
 
-  // yeet <existing> …
-  if (rest[0] && store.exists(rest[0])) {
-    const agent = store.load(rest[0]);
+  if (rest[0] === "ask") {
+    const agent = named("ask");
+    return agent ? cmdAsk(agent.name, rest.slice(1).join(" ") || undefined, ui) : EXIT.usage;
+  }
+
+  if (rest[0] === "rm") {
+    const agent = named("rm");
+    return agent ? cmdRm(agent.name, ui) : EXIT.usage;
+  }
+
+  // Everything below is the bare `yeet` command: work, test, push, rename.
+  if (flags.name && store.exists(flags.name)) {
+    const agent = store.load(flags.name);
     if (flags.model) {
       agent.model = flags.model;
       store.save(agent);
@@ -829,7 +1048,7 @@ async function main(): Promise<number> {
       if (!lock) { ui.event({ event: "error", message: `"${agent.name}" is running — rename it when it's done` }); return EXIT.usage; }
       try {
         const renamed = store.rename(agent, flags.rename);
-        ui.event({ event: "info", message: `${rest[0]} is now ${renamed.name} (branch ${renamed.branch})` });
+        ui.event({ event: "info", message: `${agent.name} is now ${renamed.name} (branch ${renamed.branch})` });
         return 0;
       } catch (e) {
         ui.event({ event: "error", message: (e as Error).message });
@@ -838,31 +1057,55 @@ async function main(): Promise<number> {
         lock.release();
       }
     }
-    if (rest[1] === "config") return cmdAgentConfig(agent, rest.slice(2), ui);
-    if (rest[1] === "push") return cmdPush(agent, ui);
-    if (rest[1] === "test") return cmdTest(agent.name, ui);
-    if (rest.length >= 2) return runAgentLoop(agent, flags, ui, rest.slice(1).join(" "));
+    // Bare, on their own, these are the two verbs. With anything around them they are just
+    // words in a task, which is exactly the ambiguity that killed the positional name.
+    if (rest.length === 1 && rest[0] === "test") return cmdTest(agent.name, ui);
+    if (rest.length === 1 && rest[0] === "push") return cmdPush(agent, ui);
+    if (rest.length) return runAgentLoop(agent, flags, ui, rest.join(" "));
 
     ui.event({
       event: "error",
-      message: `"${agent.name}" exists. Give it work (yeet ${agent.name} "<task>"), ask about it (yeet ask ${agent.name}), or configure it (yeet ${agent.name} config).`,
+      message: `"${agent.name}" exists. Give it work (yeet --name ${agent.name} "<task>"), ask about it (yeet ask --name ${agent.name}), or configure it (yeet config --name ${agent.name}).`,
     });
     return EXIT.usage;
   }
 
+  if (rest.length === 1 && (rest[0] === "test" || rest[0] === "push")) {
+    ui.event({ event: "error", message: `which agent? yeet --name <n> ${rest[0]} — see yeet ls` });
+    return EXIT.usage;
+  }
   if (flags.rename) {
-    ui.event({ event: "error", message: "--rename works on an existing agent: yeet <name> --rename <new>" });
+    ui.event({ event: "error", message: "--rename needs an existing agent: yeet --name <old> --rename <new>" });
     return EXIT.usage;
   }
 
   // New agent.
-  const task = rest.join(" ");
+  const task = rest.join(" ").trim();
+  if (!task) {
+    ui.event({
+      event: "error",
+      message: flags.name
+        ? `there is no agent called "${flags.name}". To start one, tell it what to build: yeet --name ${flags.name} "<task>"`
+        : `tell it what to build: yeet "build me a thing"`,
+    });
+    return EXIT.usage;
+  }
   let agent: store.Agent;
   try {
     agent = store.create({ task, model, name: flags.name ?? undefined });
   } catch (e) {
     ui.event({ event: "error", message: (e as Error).message });
     return EXIT.usage;
+  }
+  // A configured default origin is a starting point, not a requirement: if it is unreachable
+  // the agent still gets to work, isolated, rather than the run dying on a settings problem.
+  if (cfg.origin) {
+    const r = store.setOrigin(agent, cfg.origin);
+    ui.event(
+      r.detail.startsWith("could not")
+        ? { event: "warning", message: `${r.detail} — starting isolated instead` }
+        : { event: "info", message: r.detail },
+    );
   }
   return runAgentLoop(agent, flags, ui);
 }

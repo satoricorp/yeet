@@ -12,13 +12,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { getKey, PROVIDER_ENV } from "./secrets";
 
-const PROVIDER_ENV: Record<string, string> = {
-  openrouter: "OPENROUTER_API_KEY",
-  openai: "OPENAI_API_KEY",
-  google: "GEMINI_API_KEY",
-  groq: "GROQ_API_KEY",
-};
+// PROVIDER_ENV is imported from secrets.ts: two copies of that map would drift the moment a
+// provider is added to one of them.
 
 export type BridgedKey = { name: string; value: string; provider: string };
 
@@ -27,9 +24,14 @@ export function bridgeKey(model: string): BridgedKey | null {
   const envName = PROVIDER_ENV[provider];
   if (!envName) return null;
 
-  // An explicitly exported key wins over opencode's store.
+  // Precedence, most explicit first: an exported env var is someone deliberately overriding
+  // for this shell; yeet's own store is what they configured; opencode's is a convenience so
+  // people already set up there do not have to enter anything twice.
   const fromEnv = process.env[envName];
   if (fromEnv) return { name: envName, value: fromEnv, provider };
+
+  const stored = getKey(provider);
+  if (stored) return { name: envName, value: stored, provider };
 
   const authPath = join(homedir(), ".local", "share", "opencode", "auth.json");
   if (!existsSync(authPath)) return null;
