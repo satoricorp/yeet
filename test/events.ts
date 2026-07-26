@@ -49,7 +49,7 @@ console.log("\n\x1b[36m▪\x1b[0m append / since");
   const store = new FileEventStore();
 
   const created: EventBody = {
-    kind: "created", name: NAME, userPrompt: "reverse stdin", model: "openrouter/z-ai/glm-5.2",
+    kind: "created", agentId: ulid(), name: NAME, userPrompt: "reverse stdin", model: "openrouter/z-ai/glm-5.2",
     session: { program: "pi", file: "session/a.jsonl" },
     git: { branch: `yeet/${NAME}`, baseCommit: "8ffb35d", origin: null },
   };
@@ -61,7 +61,7 @@ console.log("\n\x1b[36m▪\x1b[0m append / since");
       proposedBy: "agent", approvedBy: "auto", changedOnApproval: false, protectedTests: {} },
     { kind: "iteration", n: 1,
       agent: { seconds: 55, costUsd: 0.0155, outcome: "edited", stoppedBy: null, sessionEnd: 47 },
-      git: { commit: "c4f9a02", filesChanged: 9, linesAdded: 214, linesRemoved: 0, protectedTestsChanged: [] },
+      git: { commit: "c4f9a02", treeChanged: true, filesChanged: 9, linesAdded: 214, linesRemoved: 0, protectedTestsChanged: [] },
       verify: { command: "bun test", exitCode: 0, passed: true } },
   ]);
 
@@ -85,19 +85,19 @@ console.log("\n\x1b[36m▪\x1b[0m fold");
   reset();
   const store = new FileEventStore();
   store.append(NAME, [
-    { kind: "created", name: NAME, userPrompt: "reverse stdin", model: "m1",
+    { kind: "created", agentId: ulid(), name: NAME, userPrompt: "reverse stdin", model: "m1",
       session: { program: "pi", file: "session/a.jsonl" },
       git: { branch: `yeet/${NAME}`, baseCommit: "8ffb35d", origin: null } },
     { kind: "config", key: "origin", value: "git@github.com:x/y.git", setBy: "user" },
     { kind: "verify_run", reason: "baseline", command: "bun test", exitCode: 1, passed: false },
     { kind: "iteration", n: 1,
       agent: { seconds: 55, costUsd: 0.02, outcome: "edited", stoppedBy: null, sessionEnd: 47 },
-      git: { commit: "aaa1111", filesChanged: 9, linesAdded: 214, linesRemoved: 0, protectedTestsChanged: [] },
+      git: { commit: "aaa1111", treeChanged: true, filesChanged: 9, linesAdded: 214, linesRemoved: 0, protectedTestsChanged: [] },
       verify: { command: "bun test", exitCode: 1, passed: false } },
     // No commit: the agent changed nothing, so this must NOT move the checkpoint.
     { kind: "iteration", n: 2,
       agent: { seconds: 12, costUsd: 0.03, outcome: "no_edit", stoppedBy: null, sessionEnd: 61 },
-      git: { commit: null, filesChanged: 0, linesAdded: 0, linesRemoved: 0, protectedTestsChanged: [] },
+      git: { commit: null, treeChanged: false, filesChanged: 0, linesAdded: 0, linesRemoved: 0, protectedTestsChanged: [] },
       verify: { command: "bun test", exitCode: 1, passed: false } },
     { kind: "status", status: "stalled", reason: "no progress for 2 iterations" },
   ]);
@@ -105,7 +105,7 @@ console.log("\n\x1b[36m▪\x1b[0m fold");
   const s = fold(store.since(NAME))!;
   check("status is the last status event", s.status === "stalled");
   check("cost sums every iteration", Math.abs(s.costUsd - 0.05) < 1e-9, `${s.costUsd}`);
-  check("iterations counted", s.iterations === 2);
+  check("iterations counted", s.iterations.length === 2);
   check("config applied", s.git.origin === "git@github.com:x/y.git");
   check("target defaults to main", s.git.target === "main");
   check("checkpoint is the last COMMITTING iteration", s.checkpoint?.commit === "aaa1111", JSON.stringify(s.checkpoint));

@@ -73,8 +73,8 @@ for (const name of names) {
     `${state.costUsd} vs ${blob.costUsd}`);
 
   const agentIterations = blob.iterations.filter((i) => i.phase === "agent").length;
-  check(name, "iterations", state.iterations === agentIterations,
-    `${state.iterations} vs ${agentIterations} agent-phase records`);
+  check(name, "iterations", state.iterations.length === agentIterations,
+    `${state.iterations.length} vs ${agentIterations} agent-phase records`);
 
   check(name, "verify.command", (state.verify?.command ?? null) === (blob.verify?.command ?? null),
     `${state.verify?.command} vs ${blob.verify?.command}`);

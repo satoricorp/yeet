@@ -22,7 +22,9 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 import { AGENTS_DIR } from "./host";
-import { record, ulid } from "./events";
+// Aliased: agent.ts already exports `AgentState` for the status enum, while events.ts uses the
+// name for the folded state object. Two different things, one word.
+import { fold, log, record, ulid, type AgentState as FoldedState } from "./events";
 
 export type IterationRecord = {
   n: number;
@@ -117,7 +119,72 @@ export function exists(name: string): boolean {
   return existsSync(metaPath(name));
 }
 
+/** Rebuild the Agent shape the rest of the code expects from replayed state. Everything here
+ *  is derived — there is nothing agent.json holds that the log does not. */
+function fromState(s: FoldedState): Agent {
+  return {
+    id: s.id,
+    name: s.name,
+    createdAt: s.createdAt,
+    repo: s.legacyRepo,
+    origin: s.git.origin,
+    baseHead: s.git.baseCommit,
+    branch: s.git.branch,
+    model: s.model,
+    task: s.userPrompt,
+    verify: s.verify
+      ? {
+          command: s.verify.command,
+          testFiles: s.verify.testFiles,
+          coverageCommand: s.verify.coverageCommand,
+          source: s.verify.proposedBy,
+          frozen: s.verify.protectedTests,
+        }
+      : null,
+    coverage: s.coverage,
+    state: s.status,
+    costUsd: s.costUsd,
+    iterations: s.iterations.map((it) => ({
+      n: it.n,
+      phase: "agent",
+      agentSeconds: it.seconds,
+      costUsd: it.costUsd,
+      insertions: it.linesAdded,
+      deletions: it.linesRemoved,
+      filesChanged: it.filesChanged,
+      treeChanged: it.treeChanged,
+      testExit: it.testExit,
+      verdict: it.verdict,
+      touchedFrozenTests: it.protectedTestsChanged.length > 0 || undefined,
+      stopReason: it.stoppedBy ?? undefined,
+    })),
+  };
+}
+
+/**
+ * The log is the truth; agent.json is a cache regenerated from it.
+ *
+ * An agent with no log yet is one that predates it: read the blob, replay it into a log, then
+ * return the REPLAYED result rather than the blob. Going through the same path immediately
+ * proves the backfill produced something faithful, instead of leaving that to be discovered
+ * later by a sync that quietly disagrees.
+ */
 export function load(name: string): Agent {
+  const replayed = fold(log.since(name));
+  if (replayed) {
+    const agent = fromState(replayed);
+    const next = JSON.stringify(agent, null, 2) + "\n";
+    // Only rewrite when it actually differs — `yeet ls` loads every agent, and a cache refresh
+    // should not mean N pointless writes.
+    if (!existsSync(metaPath(name)) || readFileSync(metaPath(name), "utf8") !== next) {
+      writeFileSync(metaPath(name), next, { mode: 0o600 });
+    }
+    return agent;
+  }
+  return loadLegacy(name);
+}
+
+function loadLegacy(name: string): Agent {
   const raw = JSON.parse(readFileSync(metaPath(name), "utf8")) as Agent & { testCommand?: string | null };
   // Migrate the pre-verify era in place: testCommand becomes a user-sourced Verify.
   if (raw.verify === undefined) {
@@ -142,7 +209,10 @@ export function load(name: string): Agent {
       model: raw.model,
       session: { program: "pi", file: "session" },
       git: { branch: raw.branch, baseCommit: raw.baseHead, origin: raw.origin },
-    });
+      legacyRepo: raw.repo ?? null,
+      // The agent was created then, not now. Stamping "now" rewrote every migrated
+      // agent's creation date to the moment it was first loaded.
+    }, raw.createdAt);
     // Replay the recorded history rather than seeding only the final state. agent.json still
     // holds every iteration, so a log that omitted them would disagree with the blob it is
     // replacing on cost and iteration count — and the consistency check would (correctly)
@@ -171,6 +241,7 @@ export function load(name: string): Agent {
         },
         git: {
           commit: idx === lastChanged && head.ok ? head.out : null,
+          treeChanged: it.treeChanged,
           filesChanged: it.filesChanged, linesAdded: it.insertions, linesRemoved: it.deletions,
           protectedTestsChanged: it.touchedFrozenTests ? ["(unknown — predates the log)"] : [],
         },
@@ -195,11 +266,14 @@ export function load(name: string): Agent {
       record(name, {
         kind: "coverage", pct: raw.coverage.pct,
         coveredLines: raw.coverage.coveredLines, totalLines: raw.coverage.totalLines,
-      });
+      }, raw.coverage.at);
     }
     if (raw.state !== "running") {
       record(name, { kind: "status", status: raw.state, reason: "backfilled from agent.json" });
     }
+    // Return the replay, not the blob — same path as every other load from here on.
+    const replayed = fold(log.since(name));
+    if (replayed) return fromState(replayed);
   }
   return raw;
 }

@@ -68,6 +68,11 @@ export type MergeResult = "clean" | "conflicted" | "resolved" | "aborted";
  *  there are no empty commits, so absence is the signal. */
 export type GitChange = {
   commit: string | null;
+  /** Explicit, NOT derived from `commit !== null`. That derivation holds for live iterations
+   *  (the runner only commits when the tree changed) but not for backfilled ones, where per
+   *  iteration commit shas were never stored — so every earlier tree-changing iteration was
+   *  being replayed as "no edit". */
+  treeChanged: boolean;
   filesChanged: number;
   linesAdded: number;
   linesRemoved: number;
@@ -87,7 +92,11 @@ export type EventBody =
    *  make two machines disagree about which agent they are talking about. */
   | { kind: "created"; agentId: string; name: string; userPrompt: string; model: string;
       session: { program: string; file: string };
-      git: { branch: string; baseCommit: string | null; origin: string | null } }
+      git: { branch: string; baseCommit: string | null; origin: string | null };
+      /** Legacy passthrough: agents from the era when yeet cloned the repo containing cwd
+       *  recorded a host path here. New agents never set it. Carried so replaying an old
+       *  agent does not silently relabel it "isolated" in `yeet ls`. */
+      legacyRepo?: string | null }
   | { kind: "prompt"; from: "user" | "agent"; text: string }
   /** `baseCommit` is present only when setting an origin also imported it as the new base,
    *  which happens for a pristine agent. The two facts always occur together, so splitting
@@ -119,7 +128,10 @@ export type AgentEvent = EventBody & { id: string; at: string };
 /** The entire surface a cloud backend has to implement. A file today; `INSERT` and
  *  `SELECT … WHERE id > $1` tomorrow. Nothing above this interface changes. */
 export interface EventStore {
-  append(agent: string, bodies: EventBody[]): AgentEvent[];
+  /** `at` overrides the occurrence time. Backfill needs it: an event replayed out of an old
+   *  agent.json happened in the past, and stamping it "now" rewrites history — it reset every
+   *  migrated agent's creation date to the moment it was first loaded. */
+  append(agent: string, bodies: EventBody[], at?: string): AgentEvent[];
   since(agent: string, afterId?: string): AgentEvent[];
   agents(): string[];
 }
@@ -127,10 +139,10 @@ export interface EventStore {
 const logPath = (agent: string) => join(AGENTS_DIR, agent, "events.jsonl");
 
 export class FileEventStore implements EventStore {
-  append(agent: string, bodies: EventBody[]): AgentEvent[] {
+  append(agent: string, bodies: EventBody[], atOverride?: string): AgentEvent[] {
     const dir = join(AGENTS_DIR, agent);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    const at = new Date().toISOString();
+    const at = atOverride ?? new Date().toISOString();
     const events = bodies.map((body) => ({ id: ulid(), at, ...body }) as AgentEvent);
     if (events.length) {
       appendFileSync(logPath(agent), events.map((e) => JSON.stringify(e)).join("\n") + "\n", { mode: 0o600 });
@@ -170,9 +182,9 @@ export const log: EventStore = new FileEventStore();
 
 /** Append one event. Recording must never take down a run: a failed append costs history, but
  *  throwing here would cost the work itself, which is strictly worse. */
-export function record(agent: string, body: EventBody): AgentEvent | null {
+export function record(agent: string, body: EventBody, at?: string): AgentEvent | null {
   try {
-    return log.append(agent, [body])[0] ?? null;
+    return log.append(agent, [body], at)[0] ?? null;
   } catch (e) {
     console.error(`yeet: could not record ${body.kind} for ${agent}: ${(e as Error).message}`);
     return null;
@@ -183,23 +195,44 @@ export function record(agent: string, body: EventBody): AgentEvent | null {
 
 export type Checkpoint = { id: string; commit: string; sessionEnd: number };
 
+/** One iteration, flattened for consumers. Everything here is derived from the event — the
+ *  log is the only place iteration history lives once agent.json becomes a cache. */
+export type IterationSummary = {
+  n: number;
+  seconds: number;
+  costUsd: number;
+  outcome: Outcome;
+  stoppedBy: StoppedBy;
+  commit: string | null;
+  treeChanged: boolean;
+  filesChanged: number;
+  linesAdded: number;
+  linesRemoved: number;
+  protectedTestsChanged: string[];
+  testExit: number | null;
+  verdict: "green" | "red" | "none";
+};
+
 export type AgentState = {
   /** Stable across renames and across machines. The name is only a handle. */
   id: string;
   name: string;
+  createdAt: string;
   userPrompt: string;
   model: string;
   status: Status;
   /** Every dollar spent: iterations and chat both. */
   costUsd: number;
-  coverage: { pct: number; coveredLines: number; totalLines: number } | null;
+  coverage: { pct: number; coveredLines: number; totalLines: number; at: string } | null;
   git: { branch: string; baseCommit: string | null; origin: string | null; target: string };
+  /** See EventBody.created.legacyRepo. */
+  legacyRepo: string | null;
   session: { program: string; file: string } | null;
   verify: {
     command: string; testFiles: string[]; coverageCommand: string | null;
     proposedBy: "agent" | "user"; protectedTests: Record<string, string>;
   } | null;
-  iterations: number;
+  iterations: IterationSummary[];
   /** Resume position: the last iteration that actually produced a commit. */
   checkpoint: Checkpoint | null;
   /** Id of the last event folded, so a caller knows what to ask `since()` for next. */
@@ -216,15 +249,17 @@ export function fold(events: AgentEvent[]): AgentState | null {
   const state: AgentState = {
     id: created.agentId,
     name: created.name,
+    createdAt: created.at,
     userPrompt: created.userPrompt,
     model: created.model,
     status: "running",
     costUsd: 0,
     coverage: null,
     git: { ...created.git, target: "main" },
+    legacyRepo: created.legacyRepo ?? null,
     session: created.session,
     verify: null,
-    iterations: 0,
+    iterations: [],
     checkpoint: null,
     head: null,
   };
@@ -244,7 +279,7 @@ export function fold(events: AgentEvent[]): AgentState | null {
         state.git.branch = e.branch;
         break;
       case "coverage":
-        state.coverage = { pct: e.pct, coveredLines: e.coveredLines, totalLines: e.totalLines };
+        state.coverage = { pct: e.pct, coveredLines: e.coveredLines, totalLines: e.totalLines, at: e.at };
         break;
       case "chat":
         state.costUsd += e.costUsd;
@@ -256,8 +291,22 @@ export function fold(events: AgentEvent[]): AgentState | null {
         };
         break;
       case "iteration":
-        state.iterations++;
         state.costUsd += e.agent.costUsd;
+        state.iterations.push({
+          n: e.n,
+          seconds: e.agent.seconds,
+          costUsd: e.agent.costUsd,
+          outcome: e.agent.outcome,
+          stoppedBy: e.agent.stoppedBy,
+          commit: e.git.commit,
+          treeChanged: e.git.treeChanged,
+          filesChanged: e.git.filesChanged,
+          linesAdded: e.git.linesAdded,
+          linesRemoved: e.git.linesRemoved,
+          protectedTestsChanged: e.git.protectedTestsChanged,
+          testExit: e.verify?.exitCode ?? null,
+          verdict: e.verify ? (e.verify.passed ? "green" : "red") : "none",
+        });
         if (e.git.commit) {
           state.checkpoint = { id: e.id, commit: e.git.commit, sessionEnd: e.agent.sessionEnd };
         }

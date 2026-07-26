@@ -240,7 +240,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
         record(agent.name, {
           kind: "iteration", n: iterN,
           agent: { seconds: r.agentSeconds, costUsd: delta, outcome: "stopped", stoppedBy: r.stopReason, sessionEnd: r.session.turns },
-          git: { commit: null, filesChanged: 0, linesAdded: 0, linesRemoved: 0, protectedTestsChanged: [] },
+          git: { commit: null, treeChanged: r.treeChanged, filesChanged: r.filesChanged, linesAdded: r.insertions, linesRemoved: r.deletions, protectedTestsChanged: r.touchedFrozen },
           verify: null,
         });
         break;
@@ -262,6 +262,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
         },
         git: {
           commit: r.committed ? r.afterHead : null,
+          treeChanged: r.treeChanged,
           filesChanged: r.filesChanged, linesAdded: r.insertions, linesRemoved: r.deletions,
           protectedTestsChanged: r.touchedFrozen,
         },
