@@ -29,7 +29,10 @@ const REPO_ROOT = new URL("..", import.meta.url).pathname;
 
 export type Limits = { maxIterations: number; maxCostUsd: number; stallMs: number; hardCeilingMs: number };
 export const DEFAULT_LIMITS: Limits = {
-  maxIterations: 5,
+  /** Deliberately generous. The round cap is a backstop against runaway, NOT the mechanism
+   *  for deciding an agent is done — that is the stall detectors and the live budget cap. A
+   *  low cap cuts off agents that were still making progress, which is the worse error. */
+  maxIterations: 25,
   maxCostUsd: 2,
   /** No observable sign of life for this long ⇒ the controller escalates (STOP, then kill). */
   stallMs: 10 * 60 * 1000,
@@ -308,7 +311,7 @@ export async function runCoverage(agent: store.Agent, n: number): Promise<Covera
   }
 }
 
-/** `yeet ask <name> "<question>"` — a conversation with the agent about its work. Same
+/** `yeet ask --name <n> "<question>"` — a conversation with the agent about its work. Same
  *  session, fresh VM, zero commits (the runner discards chat-phase edits). Returns the
  *  answer text and what the exchange cost. */
 export async function runChat(

@@ -74,6 +74,63 @@ export function parseCounts(log: string): TestCounts | null {
   return null;
 }
 
+/**
+ * A stable fingerprint of WHICH tests are failing, so "busy but going nowhere" is detectable.
+ *
+ * The existing no-progress check compares tree hashes, which only catches an agent that edits
+ * nothing or edits back to identical content. It misses the far more common shape: the agent
+ * rewrites something every round, the tree differs every round, and the same four tests fail
+ * every round. Without this, raising the round cap just buys more of that.
+ *
+ * Normalisation is the whole difficulty. Too little and every run looks unique because a
+ * duration changed, so a real stall never fires. Too much and genuinely different failures
+ * collapse together, so yeet gives up on an agent that was making progress. Timings, temp
+ * paths, addresses and PIDs are noise; file:line is signal and stays.
+ */
+export function failureSignature(log: string): string | null {
+  const text = log.replace(/\x1b\[[0-9;]*m/g, "");
+
+  // Prefer the identities of the failing tests: stable against reordering and unrelated churn.
+  const ids = new Set<string>();
+  const patterns = [
+    /^\s*\(fail\)\s+(.+?)(?:\s+\[[\d.]+m?s\])?$/gm, // bun
+    /^not ok \d+ - (.+?)(?:\s+#.*)?$/gm,            // node --test / TAP
+    /^FAILED\s+(\S+)/gm,                            // pytest
+    /^\s*---- (\S+) stdout ----$/gm,                // cargo
+    /^\s*[×✗]\s+(.+?)(?:\s+\d+ms)?$/gm,             // vitest
+    /^\s*✕\s+(.+?)(?:\s+\(\d+\s*ms\))?$/gm,         // jest
+    /^--- FAIL: (\S+)/gm,                           // go
+  ];
+  for (const re of patterns) for (const m of text.matchAll(re)) if (m[1]) ids.add(m[1].trim());
+
+  if (ids.size > 0) return hash([...ids].sort().join("\n"));
+
+  // No recognisable test identities — fall back to the shape of the tail, scrubbed of the
+  // things that differ between two runs of the same failure.
+  const tail = text
+    .split("\n")
+    .slice(-200)
+    .join("\n")
+    .replace(/\d+(\.\d+)?\s*(ms|µs|s|sec|seconds)\b/g, "T")
+    .replace(/\b\d{4}-\d{2}-\d{2}[T ][\d:.]+Z?\b/g, "TS")
+    .replace(/0x[0-9a-f]+/gi, "ADDR")
+    .replace(/\/(?:tmp|var\/folders)\/[\w./-]+/g, "TMP")
+    .replace(/\bpid[= ]\d+/gi, "PID")
+    .replace(/\s+/g, " ")
+    .trim();
+  return tail ? hash(tail) : null;
+}
+
+/** FNV-1a. Not cryptographic — this only ever compares two of its own outputs. */
+function hash(s: string): string {
+  let h = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+
 export type Finding = { gate: string; detail: string };
 
 /** Minimum tests before a pass is worth believing. Low on purpose — this catches "nothing

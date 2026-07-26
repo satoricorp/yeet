@@ -32,10 +32,10 @@ import {
 import { Ui, C, usd, dur, type Mode } from "./ui";
 import { plainText, plebMoney, lines } from "./voice";
 import { loadConfig, saveConfig, DEFAULT_MODEL, VOICES, type Voice } from "./config";
-import { hiddenPrompt, setKey, deleteKey, listKeys, fingerprint, KNOWN_PROVIDERS, PROVIDER_ENV } from "./secrets";
+import { hiddenPrompt, setKey, deleteKey, listKeys, fingerprint, KEYS_PATH, KNOWN_PROVIDERS, PROVIDER_ENV } from "./secrets";
 import { costDelta, findSessionFile, readSession } from "./session";
 import { record } from "./events";
-import { checkCounts, checkCheats, implementationFiles } from "./gates";
+import { checkCounts, checkCheats, implementationFiles, failureSignature } from "./gates";
 import { reviewWorkspace } from "./review";
 
 const EXIT = { passed: 0, usage: 1, stalled: 2, capped: 3, failed: 4, unverified: 5 } as const;
@@ -157,6 +157,8 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
     // totals are cumulative — adding them per iteration double-counted every earlier one.
     let prevReading = readSession(findSessionFile(join(dir, "session")));
     let strikes = 0;
+    /** Fingerprint of the last iteration's failures, for the busy-but-going-nowhere case. */
+    let prevSig: string | null = null;
     let agentErrors = 0;
     let outcome: store.AgentState = "capped";
     let stopNote = "";
@@ -359,12 +361,24 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
 
       // Two detectors, one strike counter. The tree SHA is git's own content hash — exact and
       // free — and it only works because artifacts live outside the workspace.
+      // Three ways to be stuck, one counter. The round cap is a backstop, not the plan —
+      // these are what actually stop a run, which is why the cap can be generous.
       const prevAgent = history.filter((h) => h.phase === "agent" && h.n !== r.n).at(-1);
-      if (!r.treeChanged) strikes++;
-      else if (prevAgent && prevAgent.afterTree === r.afterTree) strikes++;
-      else strikes = 0;
+      const sig = failureSignature(r.testLog);
+      let stuckAs: string | null = null;
+      if (!r.treeChanged) stuckAs = "it stopped changing anything";
+      else if (prevAgent && prevAgent.afterTree === r.afterTree) stuckAs = "it edited its way back to the same code";
+      else if (sig && sig === prevSig) stuckAs = "it keeps changing things and failing the same way";
+      if (stuckAs) strikes++; else strikes = 0;
+      prevSig = sig;
 
-      if (strikes >= 2) { outcome = "stalled"; stopNote = "no progress for 2 iterations"; break; }
+      if (strikes >= 2) {
+        outcome = "stalled";
+        // Name the shape of the stall. "no progress" is true of all three and useless for
+        // deciding what to do about it.
+        stopNote = `${stuckAs} — twice running`;
+        break;
+      }
       if (agent.costUsd >= flags.maxCost!) { outcome = "capped"; stopNote = `cost cap ${usd(flags.maxCost!)}`; break; }
       if (n === flags.maxIter!) { outcome = "capped"; stopNote = `iteration cap (${flags.maxIter!})`; }
     }
@@ -527,7 +541,7 @@ async function cmdTest(name: string, ui: Ui): Promise<number> {
   }
 }
 
-/** yeet ask <name> — the full story, free. With a question — a paid conversation. */
+/** yeet ask --name <n> — the full story, free. With a question — a paid conversation. */
 async function cmdAsk(name: string, question: string | undefined, ui: Ui): Promise<number> {
   if (!store.exists(name)) {
     ui.event({ event: "error", message: `no agent named "${name}" — see yeet ls` });
@@ -720,7 +734,13 @@ function cmdAgentConfig(agent: store.Agent, args: string[], ui: Ui): number {
     }
     case "coverage": {
       if (!agent.verify) { ui.event({ event: "error", message: `set a test command first: yeet config --name ${agent.name} test "<cmd>"` }); return EXIT.usage; }
-      agent.verify.coverageCommand = value || null;
+      // Clearing has to be asked for. A bare `config --name x coverage` reads as "show me the
+      // coverage command", and answering that by deleting it is not a reasonable trade.
+      if (!value) {
+        ui.event({ event: "error", message: `usage: yeet config --name ${agent.name} coverage "<command>" — or "none" to clear it` });
+        return EXIT.usage;
+      }
+      agent.verify.coverageCommand = value === "none" ? null : value;
       store.save(agent);
       record(agent.name, {
         kind: "verify_set", command: agent.verify.command, testFiles: agent.verify.testFiles,
@@ -729,7 +749,7 @@ function cmdAgentConfig(agent: store.Agent, args: string[], ui: Ui): number {
         coverageCommand: agent.verify.coverageCommand, proposedBy: agent.verify.source, approvedBy: "user",
         changedOnApproval: false, protectedTests: agent.verify.frozen,
       });
-      ui.event({ event: "info", message: value ? `coverage command is now: ${value}` : "coverage command cleared" });
+      ui.event({ event: "info", message: agent.verify.coverageCommand ? `coverage command is now: ${value}` : "coverage command cleared" });
       return 0;
     }
     case "model": {
@@ -757,7 +777,7 @@ function cmdGlobalConfig(args: string[], ui: Ui): number {
     console.log(`${C.dim("rounds")}  ${cfg.maxIterations ?? DEFAULT_LIMITS.maxIterations} ${C.dim("before it gives up")}`);
     console.log(`${C.dim("origin")}  ${cfg.origin ?? C.dim("none — new agents start isolated")}`);
     const keys = listKeys();
-    console.log(`${C.dim("keys")}    ${keys.length ? keys.map((k) => `${k.provider} ${C.dim(`(${k.where})`)}`).join(", ") : C.dim("none set — yeet config key <provider>")}`);
+    console.log(`${C.dim("keys")}    ${keys.length ? keys.join(", ") : C.dim("none set — yeet config key <provider>")}`);
     return 0;
   }
   const [key, value] = args;
@@ -852,10 +872,10 @@ async function cmdKey(args: string[], ui: Ui): Promise<number> {
   }
   if (!value) { ui.event({ event: "error", message: "nothing entered." }); return EXIT.usage; }
 
-  const where = setKey(provider, value);
+  setKey(provider, value);
   ui.event({
     event: "info",
-    message: `${provider} key saved to the ${where === "keychain" ? "macOS Keychain" : `file at ${YEET_HOME}/keys.json (0600)`}. Stored ${fingerprint(value)}.`,
+    message: `${provider} key saved (${fingerprint(value)}) to ${KEYS_PATH.replace(process.env.HOME ?? "", "~")}, mode 0600.`,
   });
   return 0;
 }
@@ -919,7 +939,7 @@ one agent's (--name)
   origin <url>        connect a repo. Imports it as the base if nothing is built yet,
                       and unlocks push.
   test "<cmd>"        how the work gets proven. Overrides what the agent registered.
-  coverage "<cmd>"    must leave an lcov file behind
+  coverage "<cmd>"    must leave an lcov file behind · "none" to clear it
   model <p/m>         just this agent
 
 Where a setting exists in both places, the agent's answer wins.`);
@@ -1014,7 +1034,8 @@ async function main(): Promise<number> {
       if (ui.mode === "json") { console.log(JSON.stringify({ event: "keys", keys })); return 0; }
       // Names and locations only. Printing a value here is how a key ends up in scrollback.
       if (!keys.length) console.log(C.dim("no keys set — yeet config key <provider>"));
-      for (const k of keys) console.log(`  ${k.provider.padEnd(12)}${C.dim(k.where === "keychain" ? "macOS Keychain" : "keys.json (0600)")}`);
+      for (const k of keys) console.log(`  ${k}`);
+      if (keys.length) console.log(C.dim(`  stored in ${KEYS_PATH.replace(process.env.HOME ?? "", "~")} (0600)`));
       return 0;
     }
     if (flags.name) {

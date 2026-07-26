@@ -1,29 +1,38 @@
 /**
- * secrets.ts — provider API keys, stored somewhere better than a JSON file.
+ * secrets.ts — provider API keys.
  *
- * Three rules, and each exists because breaking it is silent:
+ * ONE mechanism on every platform: a 0600 file inside the 0700 $YEET_HOME. The macOS Keychain
+ * is genuinely better at rest, but yeet has to run the same way on Linux and Windows, and a
+ * store whose location and guarantees change per platform means "where is my key" has three
+ * answers and a support burden to match. Linux keyrings in particular are fragmented
+ * (libsecret, gnome-keyring, KWallet) and simply absent on most servers, which is exactly
+ * where an agent runner ends up.
  *
- *   1. The value never reaches argv. `ps` is world-readable on macOS, so a key passed as a
- *      command-line argument is visible to every process on the machine for the lifetime of
- *      the call. macOS `security` normally takes the password as an argument; we drive it
- *      through `security -i` instead, which reads its command line from STDIN.
- *   2. The value never reaches the terminal. Typing a key at a normal prompt puts it in the
- *      scrollback and, worse, in shell history if it was ever an argument. The prompt below
- *      runs the tty in raw mode and echoes nothing.
+ * Be honest about what 0600 buys: it stops other users on a shared machine, and nothing else.
+ * It is not encrypted at rest, so anything that can read your home directory as you can read
+ * it too. That is the same bargain as ~/.aws/credentials, ~/.npmrc, gh and docker — familiar,
+ * and not pretending. Encrypting with a key stored beside the ciphertext would look better
+ * and protect nothing.
+ *
+ * What the file DOES buy is the three properties below, each of which fails silently if
+ * skipped:
+ *
+ *   1. The value never reaches argv. `ps` is world-readable, so a key passed as a command-line
+ *      argument is visible to every process on the machine — and lands in shell history, where
+ *      deleting it later does not help.
+ *   2. The value never reaches the terminal. The prompt runs the tty in raw mode and echoes
+ *      nothing; readline was not an option because it keeps a history buffer.
  *   3. The value never reaches the event log or the session transcript. `list` returns names
  *      only, and nothing here is ever passed to record().
  *
- * On macOS the store is the Keychain, which gives at-rest encryption with no key management
- * for us to invent badly. Elsewhere it falls back to a 0600 file, which is honest about being
- * weaker rather than pretending otherwise.
+ * If real at-rest encryption is wanted later, it goes behind setKey/getKey without touching
+ * anything above — but it needs a passphrase or an OS keyring, not a derived-from-nothing key.
  */
 import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { YEET_HOME } from "./host";
 
-const SERVICE = "yeet";
-const FALLBACK = join(YEET_HOME, "keys.json");
-const darwin = process.platform === "darwin";
+const KEYS = join(YEET_HOME, "keys.json");
 
 /** Providers yeet knows how to bridge, and the env var each one's SDK expects. */
 export const PROVIDER_ENV: Record<string, string> = {
@@ -39,95 +48,51 @@ export const PROVIDER_ENV: Record<string, string> = {
 
 export const KNOWN_PROVIDERS = Object.keys(PROVIDER_ENV);
 
-// ── keychain ──────────────────────────────────────────────────────────────────────────────
+// ── the file ─────────────────────────────────────────────────────────────────────────
 
-/** `security -i` reads its command line from stdin, which is the only way to hand it a
- *  password without that password appearing in argv. */
-function keychainSet(provider: string, value: string): boolean {
-  const escaped = value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
-  const r = Bun.spawnSync(["security", "-i"], {
-    stdin: new Blob([`add-generic-password -U -s ${SERVICE} -a ${provider} -w "${escaped}"\n`]),
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  return r.exitCode === 0;
-}
-
-function keychainGet(provider: string): string | null {
-  const r = Bun.spawnSync(["security", "find-generic-password", "-s", SERVICE, "-a", provider, "-w"], {
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-  if (r.exitCode !== 0) return null;
-  const v = r.stdout.toString().trim();
-  return v || null;
-}
-
-function keychainDelete(provider: string): boolean {
-  const r = Bun.spawnSync(["security", "delete-generic-password", "-s", SERVICE, "-a", provider], {
-    stdout: "pipe", stderr: "pipe",
-  });
-  return r.exitCode === 0;
-}
-
-// ── file fallback ─────────────────────────────────────────────────────────────────────────
-
-function fileAll(): Record<string, string> {
-  if (!existsSync(FALLBACK)) return {};
+function readAll(): Record<string, string> {
+  if (!existsSync(KEYS)) return {};
   try {
-    return JSON.parse(readFileSync(FALLBACK, "utf8")) as Record<string, string>;
+    return JSON.parse(readFileSync(KEYS, "utf8")) as Record<string, string>;
   } catch {
-    return {};
+    return {}; // a corrupt keys file degrades to "no keys", never to a crash mid-run
   }
 }
 
-function fileWrite(all: Record<string, string>): void {
-  mkdirSync(YEET_HOME, { recursive: true });
-  writeFileSync(FALLBACK, JSON.stringify(all, null, 2) + "\n", { mode: 0o600 });
-  chmodSync(FALLBACK, 0o600); // in case the file already existed with looser bits
+function writeAll(all: Record<string, string>): void {
+  mkdirSync(YEET_HOME, { recursive: true, mode: 0o700 });
+  writeFileSync(KEYS, JSON.stringify(all, null, 2) + "\n", { mode: 0o600 });
+  // mode: on writeFileSync only applies when CREATING. An existing file keeps whatever bits it
+  // had, so a file that was ever world-readable would stay that way silently.
+  chmodSync(KEYS, 0o600);
 }
 
 // ── the store ─────────────────────────────────────────────────────────────────────────────
 
-export type Store = "keychain" | "file";
-export const storeKind: Store = darwin ? "keychain" : "file";
+export const KEYS_PATH = KEYS;
 
-export function setKey(provider: string, value: string): Store {
-  if (darwin && keychainSet(provider, value)) return "keychain";
-  const all = fileAll();
+export function setKey(provider: string, value: string): void {
+  const all = readAll();
   all[provider] = value;
-  fileWrite(all);
-  return "file";
+  writeAll(all);
 }
 
 export function getKey(provider: string): string | null {
-  if (darwin) {
-    const v = keychainGet(provider);
-    if (v) return v;
-  }
-  return fileAll()[provider] ?? null;
+  return readAll()[provider] ?? null;
 }
 
 export function deleteKey(provider: string): boolean {
-  const inFile = fileAll();
-  let removed = false;
-  if (provider in inFile) {
-    delete inFile[provider];
-    fileWrite(inFile);
-    removed = true;
-  }
-  if (darwin && keychainDelete(provider)) removed = true;
-  return removed;
+  const all = readAll();
+  if (!(provider in all)) return false;
+  delete all[provider];
+  writeAll(all);
+  return true;
 }
 
 /** Names only. Returning values here is how a `list` ends up in someone's scrollback. */
-export function listKeys(): Array<{ provider: string; where: Store }> {
-  const out: Array<{ provider: string; where: Store }> = [];
-  for (const p of KNOWN_PROVIDERS) {
-    if (darwin && keychainGet(p)) out.push({ provider: p, where: "keychain" });
-    else if (fileAll()[p]) out.push({ provider: p, where: "file" });
-  }
-  return out;
+export function listKeys(): string[] {
+  const all = readAll();
+  return KNOWN_PROVIDERS.filter((p) => all[p]);
 }
 
 // ── input ─────────────────────────────────────────────────────────────────────────────────
