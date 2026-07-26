@@ -8,7 +8,7 @@
  *
  *   bun test/gates.ts
  */
-import { parseCounts, checkCounts, checkCheats, implementationFiles } from "../src/gates";
+import { parseCounts, checkCounts, checkCheats, implementationFiles, failureSignature } from "../src/gates";
 
 let failures = 0;
 const check = (label: string, ok: boolean, detail = "") => {
@@ -84,6 +84,72 @@ console.log("\n\x1b[36m▪\x1b[0m cheat scan");
   check("ignores removed lines", checkCheats("-  it.only('works', () => {})").length === 0);
   check("ignores context lines", checkCheats("   it.only('works', () => {})").length === 0);
   check("quiet on an innocent diff", checkCheats("+const sum = (a, b) => a + b;").length === 0);
+}
+
+// ── the stall fingerprint ─────────────────────────────────────────────────────────────────
+//
+// This is the detector that decides when to stop paying for an agent, and it has two ways to
+// be wrong that pull in opposite directions. Under-normalise and every run looks unique
+// because a duration changed, so a real stall never fires and 25 rounds get burned.
+// Over-normalise and genuinely different failures collapse together, so yeet gives up on an
+// agent that was making progress. Both directions are tested here.
+console.log("\n\x1b[36m▪\x1b[0m failure fingerprint");
+{
+  const run1 = `
+ (fail) auth > rejects expired token [12.40ms]
+ (fail) auth > refreshes on 401 [3.10ms]
+ 2 fail
+Ran 8 tests across 1 file. [412.00ms]`;
+
+  // Same two failures, every timing different. This is what a genuinely stuck agent produces.
+  const run2 = `
+ (fail) auth > rejects expired token [9.81ms]
+ (fail) auth > refreshes on 401 [4.44ms]
+ 2 fail
+Ran 8 tests across 1 file. [388.00ms]`;
+
+  check("identical failures with different timings match",
+    failureSignature(run1) === failureSignature(run2), `${failureSignature(run1)} vs ${failureSignature(run2)}`);
+
+  // One fixed. That IS progress and must not be mistaken for a stall.
+  const progressed = `
+ (fail) auth > refreshes on 401 [4.44ms]
+ 1 fail
+Ran 8 tests across 1 file. [377.00ms]`;
+  check("fixing one failure changes the fingerprint",
+    failureSignature(run1) !== failureSignature(progressed));
+
+  // Runners reorder freely; order is not information.
+  const reordered = `
+ (fail) auth > refreshes on 401 [1.00ms]
+ (fail) auth > rejects expired token [2.00ms]
+ 2 fail`;
+  check("reordering the same failures does not change it",
+    failureSignature(run1) === failureSignature(reordered));
+
+  check("a different test failing changes it",
+    failureSignature(run1) !== failureSignature("\n (fail) billing > applies discount [1ms]\n 1 fail"));
+
+  // Every runner the image can run.
+  check("node --test", failureSignature("not ok 1 - adds two numbers\nnot ok 2 - handles zero") ===
+    failureSignature("not ok 1 - adds two numbers\nnot ok 2 - handles zero"));
+  check("pytest", failureSignature("FAILED tests/test_auth.py::test_expiry") !== null);
+  check("go", failureSignature("--- FAIL: TestExpiry (0.00s)") !== null);
+  check("jest", failureSignature("  ✕ rejects expired token (14 ms)") !== null);
+
+  // No recognisable test ids — fall back to the shape of the tail, scrubbed.
+  const noisy1 = "Error: connect ECONNREFUSED\n    at /tmp/abc123/run.js:4:11\n  took 1.2s  pid=4412  0xdeadbeef";
+  const noisy2 = "Error: connect ECONNREFUSED\n    at /tmp/zzz999/run.js:4:11\n  took 9.9s  pid=8811  0xcafef00d";
+  check("falls back to a scrubbed tail when no test ids are present",
+    failureSignature(noisy1) === failureSignature(noisy2), "temp paths, timings, pids and addresses are noise");
+
+  // file:line is signal — a crash that moved to a different line is a different crash.
+  check("but a different file:line IS a different failure",
+    failureSignature("Error: boom\n    at src/a.ts:10:3") !== failureSignature("Error: boom\n    at src/a.ts:88:3"));
+
+  check("empty output yields null", failureSignature("") === null);
+  check("ANSI colour does not change it",
+    failureSignature("\x1b[31m (fail) auth > x\x1b[0m") === failureSignature(" (fail) auth > x"));
 }
 
 console.log("\n\x1b[36m▪\x1b[0m implementation vs test files");
