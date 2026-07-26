@@ -153,9 +153,20 @@ export async function runIteration(
     budget: opts.runAgent && opts.budget ? { capUsd: opts.budget.capUsd, spentBeforeUsd: opts.budget.spentBeforeUsd } : undefined,
     onAsk: (q) => io.ask(q),
     onVerify: async (v) => {
+      const cur = agent.verify;
+
+      // `yeet ask` is read-only by contract: the runner reverts the guest's workspace edits
+      // afterwards. But set_verify writes to agent.json and the log, which no revert touches —
+      // so a question could silently rebind the acceptance contract, and under --agent it would
+      // record approvedBy:"auto" as if someone had signed off. Answer the tool, change nothing.
+      if (opts.phase === "chat") {
+        return cur
+          ? { command: cur.command, testFiles: cur.testFiles, coverageCommand: cur.coverageCommand }
+          : { command: v.command, testFiles: v.testFiles, coverageCommand: v.coverageCommand };
+      }
+
       // Models re-call set_verify with the same content more often than you'd think. An
       // identical re-proposal is a no-op: no re-prompt, no duplicate event, same binding.
-      const cur = agent.verify;
       if (
         cur &&
         cur.command === v.command &&
