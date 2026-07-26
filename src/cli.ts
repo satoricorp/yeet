@@ -80,6 +80,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, followUp?: string)
     const history: IterationResult[] = [];
     const started = Date.now();
     let strikes = 0;
+    let agentErrors = 0;
     let outcome: store.AgentState = "capped";
     let stopNote = "";
 
@@ -134,11 +135,28 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, followUp?: string)
       });
       store.save(agent);
 
-      row(
-        String(iterN), "agent", dur(r.agentSeconds), usd(r.session.costUsd),
-        r.treeChanged ? `+${r.insertions} −${r.deletions}  ${r.filesChanged} file${r.filesChanged === 1 ? "" : "s"}` : C.dim("no edit"),
-        verdictText(r),
-      );
+      const edits = r.treeChanged
+        ? `+${r.insertions} −${r.deletions}  ${r.filesChanged} file${r.filesChanged === 1 ? "" : "s"}`
+        : r.agentVerdict === "error"
+          ? C.red("agent error")
+          : r.agentVerdict === "timeout"
+            ? C.yellow("timed out")
+            : C.dim("no edit");
+      row(String(iterN), "agent", dur(r.agentSeconds), usd(r.session.costUsd), edits, verdictText(r));
+
+      // An agent that cannot emit a valid tool call will never make progress, so retrying it
+      // is spend with no expected value. Two in a row means the model, not the task, is the
+      // problem — say so, rather than reporting a stall the user would misread as difficulty.
+      if (r.agentVerdict === "error") {
+        agentErrors++;
+        if (agentErrors >= 2) {
+          outcome = "failed";
+          stopNote = `the agent errored twice — "${agent.model}" may be unable to use tools. Try a stronger model.`;
+          break;
+        }
+      } else {
+        agentErrors = 0;
+      }
 
       // No verifier configured: one shot, and say plainly that nothing was checked.
       if (!agent.testCommand) { outcome = "capped"; stopNote = "no verifier configured"; break; }

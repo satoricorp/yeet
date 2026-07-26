@@ -34,6 +34,11 @@ export type IterationResult = {
   testExit: number | null;
   testLog: string;
   agentSeconds: number;
+  agentExit: number | null;
+  /** edited | no_edit | error | timeout — derived from three independent signals, not prose.
+   *  "error" is materially different from "no_edit": a model that cannot emit a valid tool
+   *  call will never make progress, so reporting it as a stall misdirects the user. */
+  agentVerdict: "edited" | "no_edit" | "error" | "timeout" | null;
   session: SessionStats;
   verdict: "green" | "red" | "none";
 };
@@ -95,7 +100,7 @@ export async function runIteration(
   const base: IterationResult = {
     n: opts.n, phase: opts.phase, valid: false, treeChanged: false, committed: false,
     afterTree: "", insertions: 0, deletions: 0, filesChanged: 0, testExit: null, testLog: "",
-    agentSeconds: 0, session: EMPTY_SESSION, verdict: "none",
+    agentSeconds: 0, agentExit: null, agentVerdict: null, session: EMPTY_SESSION, verdict: "none",
   };
 
   if (outcome.kind !== "ok" || !sawDone(iterDir)) {
@@ -117,11 +122,17 @@ export async function runIteration(
   const grab = (re: RegExp) => Number(diffstat.match(re)?.[1] ?? 0);
 
   const testExit = meta.testExit !== undefined ? num(meta, "testExit", -1) : null;
+  const treeChanged = bool(meta, "treeChanged");
+  const agentExit = meta.agentExit !== undefined ? num(meta, "agentExit", -1) : null;
   return {
     n: opts.n,
     phase: opts.phase,
     valid: true,
-    treeChanged: bool(meta, "treeChanged"),
+    agentExit,
+    agentVerdict: opts.runAgent
+      ? agentVerdict(session, treeChanged, agentExit ?? -1, bool(meta, "agentTimedOut"))
+      : null,
+    treeChanged,
     committed: bool(meta, "committed"),
     afterTree: meta.afterTree ?? "",
     insertions: grab(/(\d+) insertion/),
