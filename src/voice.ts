@@ -38,6 +38,31 @@ export function plebDuration(s: number): string {
   return `${(s / 3600).toFixed(1)} hours`;
 }
 
+/**
+ * The agent writes its summary as markdown and reaches for headings and bullets even when told
+ * not to. Strip the scaffolding so the wrap-up reads as prose in yeet's register rather than a
+ * document pasted into a terminal.
+ */
+export function plainText(md: string, max: number): string {
+  const flat = md
+    // Whole heading LINES, not just the hashes — stripping only the marker left "# Summary"
+    // rendering as a stray "Summary" word glued to the first sentence.
+    .replace(/^#+\s*.*$/gm, "")
+    .replace(/^[-*]\s+/gm, "") // bullets
+    .replace(/[*_`]/g, "")     // emphasis and code marks
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean)
+    .join(" ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (flat.length <= max) return flat;
+  // Cut at a sentence end where possible; a summary that stops mid-clause reads like a bug.
+  const cut = flat.slice(0, max);
+  const stop = Math.max(cut.lastIndexOf(". "), cut.lastIndexOf("? "), cut.lastIndexOf("! "));
+  return stop > max * 0.5 ? cut.slice(0, stop + 1) : cut.trimEnd() + "…";
+}
+
 export const LINES = {
   /** Verbatim from the spec's author, lightly punctuated. */
   passed: "Hey, we did it! We finished an agent. I mean, I finished an agent while you watched, which is cool.",

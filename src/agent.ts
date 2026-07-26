@@ -96,9 +96,24 @@ export function cleanName(s: string): string {
     .slice(0, 40);
 }
 
-/** Name from the first task, so `yeet ls` reads like a to-do list and you never type an id. */
+/**
+ * Name from the first task, so `yeet ls` reads like a to-do list and you never type an id.
+ *
+ * The filter is aggressive on purpose. "build me an app that counts words from stdin" used to
+ * become "build-app-that" — three words that say nothing about the job. Dropping the framing
+ * (the verb that fits any task, the noun that fits any artefact, the connectives) leaves what
+ * is actually distinctive: "counts-words-stdin".
+ */
 export function slugify(task: string, taken: (n: string) => boolean): string {
-  const stop = new Set(["a", "an", "the", "to", "for", "of", "in", "on", "and", "make", "me", "my", "please", "add"]);
+  const stop = new Set([
+    // articles, connectives, pronouns
+    "a", "an", "the", "to", "for", "of", "in", "on", "and", "or", "me", "my", "it", "its",
+    "that", "this", "from", "with", "into", "using", "via", "some", "please", "can", "you",
+    // verbs that describe every task equally
+    "make", "build", "create", "write", "add", "implement", "generate", "set", "up", "do",
+    // nouns that describe every artefact equally
+    "app", "application", "program", "tool", "script", "thing", "project", "cli", "code",
+  ]);
   const words = task
     .toLowerCase()
     .replace(/[^a-z0-9\s-]/g, " ")

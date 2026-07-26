@@ -15,7 +15,7 @@
 import * as readline from "node:readline/promises";
 import type { AgentState } from "./agent";
 import type { AskRequest, VerifyRequest, VerifyDecision } from "./bridge";
-import { LINES, blameProvider, plebMoney, plebDuration } from "./voice";
+import { LINES, blameProvider, plebMoney, plebDuration, plainText } from "./voice";
 
 export const C = {
   dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
@@ -94,7 +94,7 @@ export class Ui {
     if (!this.autoAnswer) {
       if (this.mode !== "json") {
         this.out("");
-        this.out(`🧪 It wants to prove its work with: ${C.bold(v.command)}`);
+        this.out(`It wants to prove the work with: ${C.bold(v.command)}`);
         if (v.testFiles.length) this.out(`   ${C.dim(`test files: ${v.testFiles.join(", ")}`)}`);
         if (v.coverageCommand) this.out(`   ${C.dim(`coverage: ${v.coverageCommand}`)}`);
         if (v.why) this.out(`   ${C.dim(v.why)}`);
@@ -140,14 +140,12 @@ export class Ui {
     switch (e.event) {
       case "start": {
         this.out("");
-        if (e.isNew) {
-          this.out(`⚡ Meet ${C.bold(e.agent)}. Remember the name — it's how you talk to me about this one later (yeet ask ${e.agent}, yeet ${e.agent} "do more").`);
-        } else {
-          this.out(`⚡ Back to work on ${C.bold(e.agent)}.`);
-        }
-        this.out(`   The job: ${e.task}`);
-        if (e.origin) this.out(`   ${C.dim(`connected to ${e.origin}`)}`);
-        this.out(`   ${C.dim(`I'll stop on my own after ${e.maxIter} rounds or ${plebMoney(e.maxCostUsd)}.`)}`);
+        this.out(e.isNew ? `Meet ${C.bold(e.agent)} — that's how you'll refer to it from now on.` : `Back to work on ${C.bold(e.agent)}.`);
+        this.out("");
+        this.out(`  job      ${e.task}`);
+        if (e.origin) this.out(`  repo     ${e.origin}`);
+        this.out(`  limits   ${e.maxIter} rounds or ${plebMoney(e.maxCostUsd)}`);
+        if (e.isNew) this.out(`  ${C.dim(`naming   I picked it. Pass --name next time if you'd rather choose.`)}`);
         this.out("");
         break;
       }
@@ -155,11 +153,13 @@ export class Ui {
         if (e.verdict === "red") this.out(`checked first: things fail before I touch anything. Good — that means there's a real job here.`);
         break;
       case "verify_bound":
-        this.out(`🧪 How the work gets checked: ${C.bold(e.command)}${e.edited ? C.dim(" (your edit)") : ""}${e.coverageCommand ? C.dim(" · coverage on") : ""}`);
+        // Silent unless you overrode it. Testing is table stakes, not a feature to narrate —
+        // and the proposal prompt has just shown you the command anyway.
+        if (e.edited) this.out(C.dim(`checking with your command instead: ${e.command}`));
         break;
       case "question": {
         this.out("");
-        this.out(`❓ ${C.bold("It has a question:")} ${e.question}`);
+        this.out(`${C.bold("It has a question:")} ${e.question}`);
         e.options.forEach((o, i) => {
           const marker = o === e.recommended ? C.cyan(" ← its pick") : "";
           this.out(`     ${i + 1}. ${o}${marker}`);
@@ -182,26 +182,27 @@ export class Ui {
             : "changed nothing";
         const check = e.verdict === "green" ? C.green("checks pass") : e.verdict === "red" ? C.red("checks fail") : C.dim("no checks yet");
         this.out(`round ${e.n}: ${what} — ${check}${e.interrupted ? C.yellow(" (interrupted mid-work)") : ""}`);
-        if (e.touchedFrozenTests) this.out(`   ${C.yellow("⚠ it edited tests that existed before it started — a pass that moves the goalposts.")}`);
+        if (e.touchedFrozenTests) this.out(`   ${C.yellow("it edited tests that existed before it started — a pass that moves the goalposts.")}`);
         break;
       }
       case "confirmed":
         this.out(e.ok ? `double-checked in a fresh sandbox — ${C.green("still passing")}.` : C.yellow(LINES.flaky));
         break;
       case "coverage":
-        if (e.pct === null) this.out(C.dim(`coverage: couldn't measure${e.note ? ` (${e.note})` : ""}.`));
-        else {
-          this.out(`🔬 the tests exercise ${C.bold(`${e.pct}%`)} of the code${e.pct < 50 ? C.yellow(" — that's thin; worth asking for more tests") : ""}.`);
+        // Only worth saying when it is BAD news. A good number is the expectation, not an
+        // achievement, and it already appears in the wrap-up.
+        if (e.pct !== null && e.pct < 50) {
+          this.out(C.yellow(`the tests only reach ${e.pct}% of the code — thin enough to be worth another round.`));
         }
         break;
       case "warning":
-        this.out(`${C.yellow("⚠")} ${e.message}`);
+        this.out(C.yellow(e.message));
         break;
       case "info":
         this.out(C.dim(e.message));
         break;
       case "error":
-        this.out(`${C.red("✖")} ${e.message}`);
+        this.out(C.red(e.message));
         break;
       case "done": {
         this.out("");
@@ -213,19 +214,31 @@ export class Ui {
           : C.yellow(LINES.capped);
         this.out(line);
         if (e.note) this.out(C.dim(`(${e.note})`));
+
+        const name = e.branch.replace(/^yeet\//, "");
         if (e.summary) {
           this.out("");
-          this.out(`📝 In its own words: ${e.summary}`);
+          this.out(`  ${plainText(e.summary, 400)}`);
         }
+
         this.out("");
-        this.out(`Took ${plebDuration(e.seconds)}, cost ${plebMoney(e.costUsd)}.`);
-        if (e.coveragePct !== null) this.out(`Tests cover ${e.coveragePct}% of the code.`);
-        this.out(`The work lives on branch ${C.bold(e.branch)} in its own workspace — your files were never touched.`);
-        this.out(
+        this.out(`  took     ${plebDuration(e.seconds)}, ${plebMoney(e.costUsd)}`);
+        this.out(`  branch   ${e.branch}`);
+        if (e.coveragePct !== null) this.out(C.dim(`  covered  ${e.coveragePct}% of the code`));
+
+        // Always end with somewhere to go. Every line is a command you can paste. Widths are
+        // computed rather than hand-padded, because the name length varies per agent.
+        const steps: Array<[string, string]> = [
+          [`yeet ${name} "…"`, "keep going — it remembers everything"],
+          [`yeet ask ${name}`, "what it did, in detail"],
           e.origin
-            ? `Ship it with ${C.bold(`yeet ${e.workspace.split("/").at(-2)} push`)}, or dig in with yeet ask.`
-            : C.dim(`Connect a repo later: yeet <name> config origin <url> · full detail: yeet ask <name>`),
-        );
+            ? [`yeet ${name} push`, `send the branch to ${e.origin}`]
+            : [`yeet ${name} config origin <url>`, "connect a repo, then push"],
+        ];
+        const w = Math.max(...steps.map(([cmd]) => cmd.length)) + 3;
+        this.out("");
+        this.out(C.dim("next"));
+        for (const [cmd, why] of steps) this.out(`  ${cmd.padEnd(w)}${C.dim(why)}`);
         break;
       }
     }

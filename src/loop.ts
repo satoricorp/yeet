@@ -377,8 +377,14 @@ export function firstPrompt(agent: store.Agent, dirName: string): string {
     "Do not weaken or rewrite tests that existed before you started to make them pass — yeet",
     "fingerprints those and will flag it. If a pre-existing test is wrong, say so via ask_user.",
     "",
-    `Before you finish, write /yeet/${dirName}/summary.md: 2-4 sentences for a non-technical`,
-    "reader — what you built, how it is checked, anything left to do. No jargon.",
+    // The register matters as much as the length: this text is read aloud in yeet's wrap-up,
+    // so a markdown document with headings and a "Verification" section reads as a foreign
+    // object dropped into the terminal. Two sentences of plain prose land better than four.
+    `Before you finish, write /yeet/${dirName}/summary.md — plain prose, 2-3 sentences, no`,
+    "markdown, no headings, no bullet points, no title. Say what the thing DOES and how someone",
+    "would run it. Skip the testing; that is assumed and yeet reports it separately. Write it",
+    "the way you'd tell a competent colleague in passing: matter-of-fact, no salesmanship, no",
+    `"I have successfully implemented".`,
     "",
     "Do not commit; yeet commits for you after you stop.",
   ];
