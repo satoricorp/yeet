@@ -202,6 +202,20 @@ int main(int argc, char *const argv_in[])
     if (root == NULL || optind >= argc)
         usage();
 
+    /* Resolve --root before handing it to libkrun. A SYMLINKED root does not work: virtiofs
+     * fails to bring up its worker and the guest dies with
+     *     virtio_fs: failed to create worker: Message too long (os error 40)
+     *     panicked at mmio.rs: Failed to activate device: BadActivate
+     * which says nothing whatsoever about symlinks and reads like host resource exhaustion.
+     * Measured 2026-07-25: $YEET_HOME/images/current is a symlink, and booting it failed
+     * while booting its target succeeded. (Note `cp -Rc src dst` without a trailing slash
+     * copies the symlink rather than following it, which is an easy way to hit this.)
+     * --mount already resolved its paths; --root should be no different. */
+    char *root_resolved = realpath(root, NULL);
+    if (root_resolved == NULL)
+        die("--root does not exist: %s", root);
+    root = root_resolved;
+
     char *const *cmd = &argv_in[optind];
 
     /* libkrun's argv transport corrupts any element containing BOTH '"' and '$': it
