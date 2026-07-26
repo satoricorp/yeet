@@ -9,7 +9,7 @@ turbopuffer tomorrow without a rewrite.
 
 `agent.json` used to be a mutable blob rewritten every iteration. That has no history, it is a
 last-write-wins conflict the moment two machines touch it, and it maps to an UPDATE-heavy table.
-Making the log authoritative buys: sync as *"everything after seq N"*, a checkpoint for free (the
+Making the log authoritative buys: sync as *"everything after id X"*, a checkpoint for free (the
 last event id), an insert-only Postgres table, immutable objects for S3, and a semantic index
 that can be rebuilt rather than migrated.
 
@@ -39,7 +39,7 @@ what those facts mean and appends an event. So an agent can never rewrite its ow
 | `merge` | a merge was attempted or completed |
 | `status` | the agent's status changed |
 
-Every event carries `seq` (monotonic from 1) and `at` (ISO-8601 UTC). Events are immutable and
+Every event carries `id` (a ULID)  and `at` (ISO-8601 UTC). Events are immutable and
 never rewritten.
 
 ---
@@ -52,7 +52,7 @@ The user's words are stored verbatim and never paraphrased — everything downst
 merge-conflict reasoning, refers back to this.
 
 ```json
-{"seq":1,"at":"2026-07-26T17:27:08.777Z","kind":"created",
+{"id":"01JN5JR7QF8888888888888888","at":"2026-07-26T17:27:08.777Z","kind":"created",
  "name":"reverse-cli",
  "userPrompt":"build a small CLI in Node that reads text on stdin and writes it back reversed, with tests",
  "model":"openrouter/z-ai/glm-5.2",
@@ -67,7 +67,7 @@ a cloud worker. `git.baseCommit` is this agent's *own* starting commit — not t
 ### `prompt`
 
 ```json
-{"seq":7,"at":"2026-07-26T18:03:12.887Z","kind":"prompt",
+{"id":"01JN5JRFEY3333333333333333","at":"2026-07-26T18:03:12.887Z","kind":"prompt",
  "from":"user","text":"now add refresh-token tests"}
 ```
 
@@ -77,7 +77,7 @@ later. `"agent"` appears when a parent agent drives a sub-agent.
 ### `config`
 
 ```json
-{"seq":6,"at":"2026-07-26T18:02:44.010Z","kind":"config",
+{"id":"01JN5JRQ6DFFFFFFFFFFFFFFFF","at":"2026-07-26T18:02:44.010Z","kind":"config",
  "key":"origin","value":"git@github.com:satoricorp/console.git","setBy":"user"}
 ```
 
@@ -86,7 +86,7 @@ Keys: `origin` · `target` (the branch merges aim at, default `main`) · `model`
 ### `verify_set`
 
 ```json
-{"seq":8,"at":"2026-07-26T18:03:51.400Z","kind":"verify_set",
+{"id":"01JN5JRYXWFFFFFFFFFFFFFFFF","at":"2026-07-26T18:03:51.400Z","kind":"verify_set",
  "command":"bun test && bun run typecheck",
  "testFiles":["test/**/*.test.ts"],
  "coverageCommand":null,
@@ -108,12 +108,12 @@ workspace has `protectedTests:{}`, and nothing is off-limits.
 Verify running on its own — no agent, no tokens.
 
 ```json
-{"seq":2,"at":"2026-07-26T17:27:20.100Z","kind":"verify_run",
+{"id":"01JN5JS6NBGGGGGGGGGGGGGGGG","at":"2026-07-26T17:27:20.100Z","kind":"verify_run",
  "reason":"baseline","command":"bun test","exitCode":1,"passed":false}
 ```
 
 ```json
-{"seq":4,"at":"2026-07-26T17:28:19.550Z","kind":"verify_run",
+{"id":"01JN5JSECT5555555555555555","at":"2026-07-26T17:28:19.550Z","kind":"verify_run",
  "reason":"confirm","command":"node --test","exitCode":0,"passed":true}
 ```
 
@@ -127,7 +127,7 @@ An `iteration` always means the agent worked, so the `agent` block is always pre
 questions: what did the model do, what happened to the code, did it check out.
 
 ```json
-{"seq":3,"at":"2026-07-26T17:28:03.918Z","kind":"iteration","n":1,
+{"id":"01JN5JSP49MMMMMMMMMMMMMMMM","at":"2026-07-26T17:28:03.918Z","kind":"iteration","n":1,
  "agent":{"seconds":55,"costUsd":0.01554123474,"outcome":"edited","stoppedBy":null,"sessionEnd":47},
  "git":{"commit":"c4f9a02e1b77d3a6f0e18b5c9d2a4e7f3b6c8d1a",
         "filesChanged":9,"linesAdded":214,"linesRemoved":0,"protectedTestsChanged":[]},
@@ -137,7 +137,7 @@ questions: what did the model do, what happened to the code, did it check out.
 A failure — the real $1.15 overrun that motivated the budget watchdog:
 
 ```json
-{"seq":3,"at":"2026-07-26T00:52:11.004Z","kind":"iteration","n":1,
+{"id":"01JN5JSXVREEEEEEEEEEEEEEEE","at":"2026-07-26T00:52:11.004Z","kind":"iteration","n":1,
  "agent":{"seconds":900,"costUsd":1.1510,"outcome":"stopped","stoppedBy":"stall","sessionEnd":1034},
  "git":{"commit":"9d2b06f4c1e88a7b3f05d2e6c9a1b4f7e8d3c025",
         "filesChanged":2,"linesAdded":89,"linesRemoved":1,"protectedTestsChanged":[]},
@@ -168,13 +168,13 @@ finished and the tests failed", and it has to read differently.
 three-way merge diffs both sides against the base, which is why it needs a name of its own.
 
 ```json
-{"seq":9,"at":"2026-07-26T18:20:03.441Z","kind":"merge",
+{"id":"01JN5JT5K7XXXXXXXXXXXXXXXX","at":"2026-07-26T18:20:03.441Z","kind":"merge",
  "targetBranch":"main","mergeBase":"9c3228d","targetCommit":"a81b0e2","agentCommit":"4f17e5c",
  "result":"conflicted","conflicts":2,"mergeCommit":null}
 ```
 
 ```json
-{"seq":10,"at":"2026-07-26T18:24:51.902Z","kind":"merge",
+{"id":"01JN5JTDAP2222222222222222","at":"2026-07-26T18:24:51.902Z","kind":"merge",
  "targetBranch":"main","mergeBase":"9c3228d","targetCommit":"a81b0e2","agentCommit":"4f17e5c",
  "result":"resolved","conflicts":0,"mergeCommit":"b70e4d1"}
 ```
@@ -186,11 +186,11 @@ Two events rather than one mutated: you can see it was attempted, conflicted, an
 ### `status`
 
 ```json
-{"seq":5,"at":"2026-07-26T17:28:19.612Z","kind":"status","status":"passed","reason":null}
+{"id":"01JN5JTN25WWWWWWWWWWWWWWWW","at":"2026-07-26T17:28:19.612Z","kind":"status","status":"passed","reason":null}
 ```
 
 ```json
-{"seq":4,"at":"2026-07-26T00:52:11.180Z","kind":"status","status":"capped",
+{"id":"01JN5JTWSMYYYYYYYYYYYYYYYY","at":"2026-07-26T00:52:11.180Z","kind":"status","status":"capped",
  "reason":"agent stopped mid-work after 15m without output"}
 ```
 
@@ -206,7 +206,7 @@ A total fold, small enough to recompute on every load:
 verify      = last verify_set
 status      = last status
 costUsd     = sum of iteration.agent.costUsd
-checkpoint  = last iteration with git.commit != null  →  {seq, commit, sessionEnd}
+checkpoint  = last iteration with git.commit != null  →  {id, commit, sessionEnd}
 ```
 
 ```json
@@ -215,7 +215,7 @@ checkpoint  = last iteration with git.commit != null  →  {seq, commit, session
  "status":"passed","costUsd":0.01554123474,
  "verify":{"command":"node --test && node scripts/coverage.js","proposedBy":"agent","protectedTests":{}},
  "git":{"branch":"yeet/reverse-cli","origin":null},
- "checkpoint":{"seq":3,"commit":"c4f9a02e1b77d3a6f0e18b5c9d2a4e7f3b6c8d1a","sessionEnd":47}}
+ "checkpoint":{"id":"01JN5JV4H3GGGGGGGGGGGGGGGG","commit":"c4f9a02e1b77d3a6f0e18b5c9d2a4e7f3b6c8d1a","sessionEnd":47}}
 ```
 
 ---
@@ -269,10 +269,10 @@ reconciliation.
 
 ## Checkpoints, resume, and cloud
 
-A checkpoint is `(commit, seq, sessionEnd)` — all three monotonic. Resume is the same four steps
+A checkpoint is `(commit, id, sessionEnd)` — all three monotonic. Resume is the same four steps
 whether it happens on a laptop or in a data centre:
 
-1. pull events after the local `seq`, replay to state
+1. pull events after the local `id`, replay to state
 2. `git fetch` the branch, check out `commit`
 3. reconstruct `~/.yeet/agents/<name>/`
 4. boot a VM over that directory
