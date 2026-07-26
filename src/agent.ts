@@ -128,10 +128,78 @@ export function load(name: string): Agent {
   }
   if (raw.origin === undefined) raw.origin = null;
   if (raw.coverage === undefined) raw.coverage = null;
-  // Agents that predate the event log get an identity now, so they can sync later.
+  // Agents that predate the event log get an identity AND a log now. Backfilling only the id
+  // would leave them permanently unreplayable: fold() returns null without a `created` event,
+  // so every one of them would be invisible to sync and to the consistency check.
   if (!raw.id) {
     raw.id = ulid();
     save(raw);
+    record(name, {
+      kind: "created",
+      agentId: raw.id,
+      name,
+      userPrompt: raw.task,
+      model: raw.model,
+      session: { program: "pi", file: "session" },
+      git: { branch: raw.branch, baseCommit: raw.baseHead, origin: raw.origin },
+    });
+    // Replay the recorded history rather than seeding only the final state. agent.json still
+    // holds every iteration, so a log that omitted them would disagree with the blob it is
+    // replacing on cost and iteration count — and the consistency check would (correctly)
+    // reject it.
+    if (raw.verify) {
+      record(name, {
+        kind: "verify_set", command: raw.verify.command, testFiles: raw.verify.testFiles,
+        coverageCommand: raw.verify.coverageCommand, proposedBy: raw.verify.source,
+        approvedBy: "auto", changedOnApproval: false, protectedTests: raw.verify.frozen,
+      });
+    }
+
+    // Commit shas were never stored per iteration, so they cannot be recovered — except for the
+    // last one that changed the tree, which is by definition the branch head. That keeps the
+    // most recent checkpoint resumable; earlier ones are honestly null.
+    const agentIters = raw.iterations.filter((i) => i.phase === "agent");
+    const lastChanged = agentIters.map((i) => i.treeChanged).lastIndexOf(true);
+    const head = git(workspaceDir(name), "rev-parse", "HEAD");
+    agentIters.forEach((it, idx) => {
+      record(name, {
+        kind: "iteration", n: it.n,
+        agent: {
+          seconds: it.agentSeconds, costUsd: it.costUsd,
+          outcome: it.treeChanged ? "edited" : "no_edit",
+          stoppedBy: it.stopReason ?? null, sessionEnd: 0,
+        },
+        git: {
+          commit: idx === lastChanged && head.ok ? head.out : null,
+          filesChanged: it.filesChanged, linesAdded: it.insertions, linesRemoved: it.deletions,
+          protectedTestsChanged: it.touchedFrozenTests ? ["(unknown — predates the log)"] : [],
+        },
+        verify: it.testExit === null ? null
+          : { command: raw.verify?.command ?? "", exitCode: it.testExit, passed: it.verdict === "green" },
+      });
+    });
+
+    // Spend that no iteration accounts for is chat: `yeet ask` adds to costUsd without pushing
+    // an iteration record, so the blob's single total silently contained both. Reconstruct the
+    // remainder rather than dropping it — otherwise the replayed total under-reports what was
+    // actually paid, which is the one number a budget cap depends on.
+    const iterated = agentIters.reduce((sum, it) => sum + it.costUsd, 0);
+    const unaccounted = raw.costUsd - iterated;
+    if (unaccounted > 1e-9) {
+      record(name, {
+        kind: "chat", question: "(reconstructed — predates the log)", costUsd: unaccounted,
+      });
+    }
+
+    if (raw.coverage) {
+      record(name, {
+        kind: "coverage", pct: raw.coverage.pct,
+        coveredLines: raw.coverage.coveredLines, totalLines: raw.coverage.totalLines,
+      });
+    }
+    if (raw.state !== "running") {
+      record(name, { kind: "status", status: raw.state, reason: "backfilled from agent.json" });
+    }
   }
   return raw;
 }
