@@ -1,13 +1,13 @@
 /**
  * agent.ts — the durable unit.
  *
- * An agent is not a run. It owns a workspace, a git branch, and a pi session, so `yeet <name>
- * "<follow-up>"` is a real continuation of a conversation rather than a fresh attempt.
+ * An agent is not a run. It owns a workspace, a git branch, and a pi session, so
+ * `yeet --name <n> "<follow-up>"` is a real continuation rather than a fresh attempt.
  *
  * Isolation is the default and only starting state: every agent begins in a blank workspace
  * that has never seen the user's repos. The outside world arrives exclusively through config —
- * `yeet <name> config origin <url>` imports a repo as the base if nothing has been built yet,
- * and unlocks `yeet <name> push`, which pushes FROM THE HOST. The guest never has a remote,
+ * `yeet config --name <n> origin <url>` imports a repo as the base if nothing has been built yet,
+ * and unlocks `yeet --name <n> push`, which pushes FROM THE HOST. The guest never has a remote,
  * so nothing that runs inside a VM can reach anything the user owns.
  *
  * Layout (0700 throughout — run.env holds a bridged API key):
@@ -45,7 +45,7 @@ export type IterationRecord = {
 export type AgentState = "running" | "passed" | "stalled" | "capped" | "failed" | "unverified";
 
 /** How the work gets proven. Registered by the agent via the set_verify tool (source
- *  "agent") or set by a human via `yeet <name> config test` (source "user"). */
+ *  "agent") or set by a human via `yeet config --name <n> test` (source "user"). */
 export type Verify = {
   command: string;
   /** Glob patterns for test files, used to freeze pre-existing tests and to exclude tests
@@ -83,7 +83,12 @@ export type Agent = {
   iterations: IterationRecord[];
 };
 
-export const RESERVED = new Set(["ls", "help", "ask", "rm", "config", "push", "test", "-h", "--help"]);
+/**
+ * Names that would read as a command. Since the name moved to --name nothing PARSES wrong if
+ * an agent is called "test" — `yeet --name test test` is unambiguous. It just reads terribly,
+ * in `yeet ls` most of all, so these stay refused.
+ */
+export const RESERVED = new Set(["ls", "help", "ask", "rm", "config", "push", "test", "merge", "-h", "--help"]);
 
 /** Names double as directory names and git branch names, so they get the same cleaning
  *  whether they came from slugify or from --name. */
@@ -421,7 +426,7 @@ export function setOrigin(agent: Agent, url: string): { imported: boolean; detai
 
 /** Push the agent's branch to the configured origin — from the HOST, never the guest. */
 export function push(agent: Agent): { ok: boolean; detail: string } {
-  if (!agent.origin) return { ok: false, detail: "no origin configured — yeet <name> config origin <url>" };
+  if (!agent.origin) return { ok: false, detail: "no origin configured — yeet config --name <n> origin <url>" };
   const r = git(workspaceDir(agent.name), "push", agent.origin, `${agent.branch}:${agent.branch}`);
   return r.ok
     ? { ok: true, detail: `pushed ${agent.branch} to ${agent.origin}` }

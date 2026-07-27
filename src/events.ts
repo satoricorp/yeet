@@ -107,7 +107,7 @@ export type EventBody =
   /** Measured once, after a confirmed pass — the number that makes a green light worth
    *  believing. Separate from verify_run because it is a property of the agent, not of a run. */
   | { kind: "coverage"; pct: number; coveredLines: number; totalLines: number }
-  /** `yeet ask <name> "…"` spends money without producing an iteration. Without this the cost
+  /** `yeet ask --name <n> "…"` spends money without producing an iteration. Without this the cost
    *  total silently under-reports. */
   | { kind: "chat"; question: string; costUsd: number }
   | { kind: "verify_set"; command: string; testFiles: string[]; coverageCommand: string | null;
