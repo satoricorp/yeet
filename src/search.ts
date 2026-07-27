@@ -50,34 +50,56 @@ export type Hit = {
   state: string;
   score: number;
   task: string;
-  /** The agent's latest summary, or null if it never wrote one. */
+  /** The agent's own prose, or null if it never left any. */
   summary: string | null;
+  /** Whether that prose is a real summary, the agent's closing words, or just its task. Worth
+   *  showing: "it never wrote a summary" is information about the run, not a rendering detail. */
+  source: Source;
   /** The best-matching sentence, for showing WHY this ranked. */
   snippet: string | null;
   /** Which of the user's words actually landed. Empty is impossible for a returned hit. */
   matched: string[];
 };
 
+/** Where an agent's description came from. Shown to the user, because "this is the summary it
+ *  wrote" and "this is the last thing it happened to say" deserve different amounts of trust. */
+export type Source = "summary" | "answer" | "task";
+
+/** A cap on how much prose one agent contributes. Logs run ~1–5 KiB today; a runaway one should
+ *  not be able to dominate the index by sheer length. */
+const MAX_PROSE = 20_000;
+
 /**
- * The agent's latest summary.
+ * The best description an agent has of itself.
  *
- * Latest, not all of them: it is what `yeet ask --name <n>` shows, and searching text the user
- * cannot then see would be a small betrayal. An agent that has merged three times has three
- * summaries and only the last one describes what it is now.
+ * `summary.md` first, latest iteration first — it is what `yeet ask --name <n>` shows, and
+ * searching text the user cannot then see would be a small betrayal. An agent that merged three
+ * times has three summaries, and only the last describes what it is now.
+ *
+ * Falling back to `agent.log` matters more than it sounds: 6 of 16 agents here never wrote a
+ * summary at all, and they are disproportionately the interesting ones — the runs that stalled
+ * or got capped stop before the summary step. Their closing words are still prose, and still
+ * say what the thing was. Without this they would be searchable only by their one-line task.
  */
-export function latestSummary(name: string): string | null {
+export function latestProse(name: string): { text: string; source: Source } | null {
   const dir = store.agentDir(name);
   if (!existsSync(dir)) return null;
-  const iters = readdirSync(dir, { withFileTypes: true })
-    .filter((e) => e.isDirectory() && /^iter-\d+$/.test(e.name))
+
+  // Reverse-alphabetical puts iter-003 before iter-001, and every iter-* before chat-*,
+  // confirm-* and coverage-* — which is exactly the order of how much they are worth.
+  const subdirs = readdirSync(dir, { withFileTypes: true })
+    .filter((e) => e.isDirectory())
     .map((e) => e.name)
     .sort()
     .reverse();
-  for (const it of iters) {
-    const p = join(dir, it, "summary.md");
-    if (!existsSync(p)) continue;
-    const text = readFileSync(p, "utf8").trim();
-    if (text) return text;
+
+  for (const file of ["summary.md", "agent.log"] as const) {
+    for (const sub of subdirs) {
+      const p = join(dir, sub, file);
+      if (!existsSync(p)) continue;
+      const text = readFileSync(p, "utf8").trim();
+      if (text) return { text: text.slice(0, MAX_PROSE), source: file === "summary.md" ? "summary" : "answer" };
+    }
   }
   return null;
 }
@@ -93,7 +115,15 @@ type Doc = {
 
 /** What ranking actually needs. Kept free of the store so the scoring can be tested against a
  *  fixed corpus rather than against whatever agents happen to exist on this machine. */
-export type SearchDoc = { name: string; state: string; task: string; summary: string | null };
+export type SearchDoc = {
+  name: string;
+  state: string;
+  task: string;
+  /** The agent's own prose, from wherever it could be found. */
+  summary: string | null;
+  /** Where that prose came from. Defaults to summary when present, task otherwise. */
+  source?: Source;
+};
 
 function build(docs: SearchDoc[]): Doc[] {
   return docs.map((d) => {
@@ -111,7 +141,10 @@ function build(docs: SearchDoc[]): Doc[] {
       }
     }
     return {
-      hit: { name: d.name, state: d.state, task: d.task, summary: d.summary },
+      hit: {
+        name: d.name, state: d.state, task: d.task, summary: d.summary,
+        source: d.source ?? (d.summary ? "summary" : "task"),
+      },
       tf,
       len,
       haystack: `${d.name} ${d.task} ${d.summary ?? ""}`.toLowerCase(),
@@ -169,12 +202,16 @@ function bestSnippet(text: string, terms: Set<string>, max = 160): string | null
 
 /** Read the corpus off disk and rank it. The only part that touches the store. */
 export function search(query: string, agents: store.Agent[]): Hit[] {
-  return rank(query, agents.map((a) => ({
-    name: a.name,
-    state: a.state,
-    task: a.task ?? "",
-    summary: latestSummary(a.name),
-  })));
+  return rank(query, agents.map((a) => {
+    const prose = latestProse(a.name);
+    return {
+      name: a.name,
+      state: a.state,
+      task: a.task ?? "",
+      summary: prose?.text ?? null,
+      source: prose?.source ?? "task",
+    };
+  }));
 }
 
 /**

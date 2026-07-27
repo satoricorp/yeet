@@ -125,6 +125,39 @@ console.log("\n\x1b[36m▪\x1b[0m snippets explain the hit");
     (rank("bucket", CORPUS)[0]?.snippet ?? "").includes("Google Cloud Storage"));
 }
 
+console.log("\n\x1b[36m▪\x1b[0m provenance");
+{
+  // 6 of 16 real agents never wrote a summary.md — disproportionately the stalled and capped
+  // ones, which stop before the summary step. Their closing words in agent.log are still prose
+  // and still say what the thing was, but the user must be told which they are looking at.
+  const wrote = doc("wrote", "do a thing", "A real summary.");
+  const said: SearchDoc = { name: "said", state: "capped", task: "do a thing", summary: "Closing words about redis.", source: "answer" };
+  const neither = doc("neither", "a task about postgres", null);
+
+  check("prose from a summary is labelled as such", rank("summary", [wrote])[0]?.source === "summary");
+  check("prose from the log is labelled 'answer'", rank("redis", [said])[0]?.source === "answer");
+  check("an agent with no prose falls back to its task", rank("postgres", [neither])[0]?.source === "task");
+  check("an agent with only a log is still findable",
+    rank("redis", [wrote, said, neither])[0]?.name === "said");
+}
+
+console.log("\n\x1b[36m▪\x1b[0m term coverage separates answers from noise");
+{
+  // The real failure this pins: "which one reverses stdin?" separated the top two agents by
+  // 1.3%, so whichever won was effectively arbitrary — but only the winner got the pasteable
+  // money-spending command. Coverage is the honest split: matching BOTH words is a different
+  // kind of hit from matching one, and ties inside that group stay ties.
+  const both1 = doc("a1", "reverses stdin", null);
+  const both2 = doc("a2", "a cli that reverses text from stdin", null);
+  const oneWord = doc("b1", "counts words from stdin", null);
+  const r = rank("reverses stdin", [both1, both2, oneWord]);
+  const most = Math.max(...r.map((h) => h.matched.length));
+  const strong = r.filter((h) => h.matched.length === most).map((h) => h.name).sort();
+  check("both full-coverage agents are strong hits", JSON.stringify(strong) === JSON.stringify(["a1", "a2"]), `got ${strong}`);
+  check("the single-word match is not a strong hit",
+    r.find((h) => h.name === "b1")!.matched.length < most);
+}
+
 console.log("\n\x1b[36m▪\x1b[0m stability");
 {
   // Same input, same order — a search that reshuffles between runs is unusable.

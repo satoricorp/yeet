@@ -660,9 +660,10 @@ function cmdFind(question: string | undefined, ui: Ui): number {
     console.log(JSON.stringify({
       event: "search",
       query: question,
+      scanned: agents.length,
       items: hits.map((h) => ({
         name: h.name, state: h.state, score: Number(h.score.toFixed(4)),
-        matched: h.matched, task: h.task, snippet: h.snippet,
+        matched: h.matched, source: h.source, task: h.task, snippet: h.snippet,
       })),
     }));
     return 0;
@@ -679,31 +680,45 @@ function cmdFind(question: string | undefined, ui: Ui): number {
     return 0;
   }
 
-  // Rank is the message, so the best match gets the first row and nothing is truncated out of
-  // it. Pad the PLAIN text before colouring — padEnd counts ANSI bytes as width.
-  const shown = hits.slice(0, 5);
-  const w = Math.max(16, ...shown.map((h) => h.name.length + 2));
+  // Agents that matched ALL the words you used are answers; ones that caught a single word are
+  // background noise that happens to score. Splitting on coverage rather than on a score ratio
+  // matters because near-ties are real here — "which one reverses stdin?" separates the top two
+  // by 1.3%, and picking a winner at that margin would be inventing a precision yeet does not
+  // have. Show both, let their own sentences decide it.
+  const most = Math.max(...hits.map((h) => h.matched.length));
+  const strong = hits.filter((h) => h.matched.length === most).slice(0, 4);
+  const also = hits.filter((h) => h.matched.length < most).slice(0, 3);
+
   console.log("");
-  console.log(C.dim(`agents that look like "${question}"`));
+  const one = strong.length === 1;
+  console.log(`${one ? "One agent looks" : `${strong.length} agents look`} related. ${C.dim(`I didn't ask ${one ? "it" : "them"} — this is what ${one ? "it" : "they"} wrote down.`)}`);
   console.log("");
-  for (const h of shown) {
+  for (const h of strong) {
     const status = h.state === "passed" ? "good" : h.state === "running" ? "running" : "failed";
     const paint = status === "good" ? C.green : status === "running" ? C.cyan : C.red;
-    console.log(`  ${h.name.padEnd(w)}${paint(status.padEnd(9))}${C.dim(h.snippet ?? h.task)}`);
+    console.log(`  ${C.bold(h.name)}  ${paint(status)}`);
+    // plainText strips the markdown — summaries are written for a file, and raw backticks and
+    // headings landing in a terminal look like a bug.
+    console.log(`    ${C.dim(plainText(h.snippet ?? h.task, 300))}`);
+    if (h.source === "answer") console.log(`    ${C.dim("(from what it said at the end — it never wrote a summary)")}`);
+    console.log("");
   }
-  if (hits.length > shown.length) {
-    console.log(C.dim(`  … and ${hits.length - shown.length} more`));
+  if (also.length) {
+    const w = Math.max(...also.map((h) => h.name.length)) + 2;
+    console.log(C.dim("also mentions it"));
+    for (const h of also) console.log(C.dim(`  ${h.name.padEnd(w)}${plainText(h.snippet ?? h.task, 90)}`));
+    console.log("");
   }
 
-  const top = shown[0]!;
-  const steps: Array<[string, string]> = [
-    [`yeet ask --name ${top.name}`, "the full story of that one. Free."],
-    [`yeet ask --name ${top.name} "why …?"`, "put the question to the agent itself (a few cents)"],
-  ];
+  // Every strong hit gets its own line. Naming only the first would hand the user a
+  // money-spending command pointed at an agent that beat the others by a rounding error.
+  const steps: Array<[string, string]> = strong.map((h) => [`yeet ask --name ${h.name}`, "the full story. Free."]);
+  steps.push([`yeet ask --name ${strong[0]!.name} "why …?"`, "put the question to it directly (a few cents)"]);
   const cw = Math.max(...steps.map(([c]) => c.length)) + 3;
-  console.log("");
   console.log(C.dim("next"));
   for (const [cmd, why] of steps) console.log(`  ${cmd.padEnd(cw)}${C.dim(why)}`);
+  console.log("");
+  console.log(C.dim(`${agents.length} agents searched on disk · nothing was woken up`));
   return 0;
 }
 
@@ -1174,6 +1189,13 @@ async function main(): Promise<number> {
     return 0;
   }
 
+  // Searching what the agents already wrote is filesystem reads and nothing else, so it must not
+  // be gated on having a VM image. Below the preflight, a command advertised as free and offline
+  // would die with "no image" on a machine that has agents but has never built one — which is
+  // exactly the machine most likely to be asking which agent did what. store.list() returns []
+  // on a missing AGENTS_DIR, so running before the mkdirSync below is safe.
+  if (rest[0] === "ask" && !flags.name) return cmdFind(rest.slice(1).join(" ") || undefined, ui);
+
   if (!existsSync(LAUNCHER) || !existsSync(CURRENT_IMAGE)) {
     console.error("yeet: no image — run guest/setup.sh first");
     return EXIT.usage;
@@ -1217,13 +1239,11 @@ async function main(): Promise<number> {
     return cmdGlobalConfig(rest.slice(1), ui);
   }
 
+  // The no---name form is handled above, before the image preflight — it costs nothing and needs
+  // no VM. Reaching here means an agent was named, which is the only form that can spend money.
   if (rest[0] === "ask") {
-    const q = rest.slice(1).join(" ") || undefined;
-    // A missing --name is not an error here: it means "look across all of them", which reads
-    // from disk and costs nothing. Only naming an agent AND asking it something spends money.
-    if (!flags.name) return cmdFind(q, ui);
     const agent = named("ask");
-    return agent ? cmdAsk(agent.name, q, ui) : EXIT.usage;
+    return agent ? cmdAsk(agent.name, rest.slice(1).join(" ") || undefined, ui) : EXIT.usage;
   }
 
   if (rest[0] === "rm") {
