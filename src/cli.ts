@@ -38,6 +38,7 @@ import { record } from "./events";
 import { checkCounts, checkCheats, implementationFiles, failureSignature } from "./gates";
 import { reviewWorkspace } from "./review";
 import { analyze, apply, publish } from "./merge";
+import { search } from "./search";
 
 const EXIT = { passed: 0, usage: 1, stalled: 2, capped: 3, failed: 4, unverified: 5 } as const;
 
@@ -633,6 +634,79 @@ async function cmdTest(name: string, ui: Ui): Promise<number> {
   }
 }
 
+/**
+ * yeet ask "<question>" — with no --name, search every agent. Free, local, no VM.
+ *
+ * This is the answer to "which one of these built the thing that…", and it deliberately stops
+ * one step short of answering the question itself: it finds the agent and hands you the command
+ * to put the question to it. Spending money because a --name was forgotten is the one behaviour
+ * this command exists to prevent.
+ */
+function cmdFind(question: string | undefined, ui: Ui): number {
+  const agents = store.list();
+
+  if (!question) {
+    if (ui.mode === "json") { console.log(JSON.stringify({ event: "error", message: "ask what?" })); return EXIT.usage; }
+    console.log("");
+    console.log("ask what? For example:");
+    console.log(`  yeet ask "which one reads from stdin?"   ${C.dim("search every agent. Free.")}`);
+    console.log(`  yeet ask --name <n> "why …?"             ${C.dim("ask one agent directly (a few cents)")}`);
+    return EXIT.usage;
+  }
+
+  const hits = search(question, agents);
+
+  if (ui.mode === "json") {
+    console.log(JSON.stringify({
+      event: "search",
+      query: question,
+      items: hits.map((h) => ({
+        name: h.name, state: h.state, score: Number(h.score.toFixed(4)),
+        matched: h.matched, task: h.task, snippet: h.snippet,
+      })),
+    }));
+    return 0;
+  }
+
+  if (!agents.length) {
+    console.log(`no agents yet — start one:  yeet "build me something"`);
+    return 0;
+  }
+  if (!hits.length) {
+    console.log("");
+    console.log(`nothing matches ${C.bold(question)}.`);
+    console.log(C.dim(`  ${agents.length} agent${agents.length === 1 ? "" : "s"} searched — yeet ls to see them all`));
+    return 0;
+  }
+
+  // Rank is the message, so the best match gets the first row and nothing is truncated out of
+  // it. Pad the PLAIN text before colouring — padEnd counts ANSI bytes as width.
+  const shown = hits.slice(0, 5);
+  const w = Math.max(16, ...shown.map((h) => h.name.length + 2));
+  console.log("");
+  console.log(C.dim(`agents that look like "${question}"`));
+  console.log("");
+  for (const h of shown) {
+    const status = h.state === "passed" ? "good" : h.state === "running" ? "running" : "failed";
+    const paint = status === "good" ? C.green : status === "running" ? C.cyan : C.red;
+    console.log(`  ${h.name.padEnd(w)}${paint(status.padEnd(9))}${C.dim(h.snippet ?? h.task)}`);
+  }
+  if (hits.length > shown.length) {
+    console.log(C.dim(`  … and ${hits.length - shown.length} more`));
+  }
+
+  const top = shown[0]!;
+  const steps: Array<[string, string]> = [
+    [`yeet ask --name ${top.name}`, "the full story of that one. Free."],
+    [`yeet ask --name ${top.name} "why …?"`, "put the question to the agent itself (a few cents)"],
+  ];
+  const cw = Math.max(...steps.map(([c]) => c.length)) + 3;
+  console.log("");
+  console.log(C.dim("next"));
+  for (const [cmd, why] of steps) console.log(`  ${cmd.padEnd(cw)}${C.dim(why)}`);
+  return 0;
+}
+
 /** yeet ask --name <n> — the full story, free. With a question — a paid conversation. */
 async function cmdAsk(name: string, question: string | undefined, ui: Ui): Promise<number> {
   if (!store.exists(name)) {
@@ -995,15 +1069,20 @@ function help(topic?: string): void {
   }
 
   if (topic === "ask") {
-    console.log(`yeet ask — what an agent did, and questions about it.
+    console.log(`yeet ask — which agent did what, and questions about it.
 
-  yeet ask --name <n>              the story of its last run. Free.
-  yeet ask --name <n> "why X?"     put the question to the agent itself. A few cents.
+  yeet ask "which one reads stdin?"   search every agent. Free.
+  yeet ask --name <n>                 the story of its last run. Free.
+  yeet ask --name <n> "why X?"        put the question to the agent itself. A few cents.
 
-The free version reads what yeet already recorded. The paid version wakes the agent in a
-sandbox with its own history — it can read its code, but it cannot change it.
+Without --name it searches: it matches your words against every agent's task and its own
+summary, on this machine, and hands you the agent's name. Nothing boots and nothing is spent.
 
-  --name <n>   required: which agent
+Naming an agent AND asking it something is the only form that costs money — it wakes that
+agent in a sandbox with its own history, where it can read its code but not change it. So a
+forgotten --name can never turn into a question asked of every agent you own.
+
+  --name <n>   which agent. Omit it to search across all of them.
   --agent      JSON instead of prose`);
     return;
   }
@@ -1058,6 +1137,7 @@ run this.
   yeet --name <n> merge          combine its work with your main branch
 
   yeet ls                        every agent and how it went
+  yeet ask "which one did X?"    find the agent you mean. Free.
   yeet ask --name <n>            what one did, and questions about it
   yeet config                    settings, yours or one agent's
   yeet rm --name <n>             delete an agent
@@ -1138,8 +1218,12 @@ async function main(): Promise<number> {
   }
 
   if (rest[0] === "ask") {
+    const q = rest.slice(1).join(" ") || undefined;
+    // A missing --name is not an error here: it means "look across all of them", which reads
+    // from disk and costs nothing. Only naming an agent AND asking it something spends money.
+    if (!flags.name) return cmdFind(q, ui);
     const agent = named("ask");
-    return agent ? cmdAsk(agent.name, rest.slice(1).join(" ") || undefined, ui) : EXIT.usage;
+    return agent ? cmdAsk(agent.name, q, ui) : EXIT.usage;
   }
 
   if (rest[0] === "rm") {

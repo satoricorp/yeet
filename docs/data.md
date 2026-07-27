@@ -265,6 +265,25 @@ Postgres is enough for a long time. S3 only earns its place when session blobs g
 adding it later is not a migration, because immutable append-only records move without
 reconciliation.
 
+### Finding an agent, and why local search is lexical
+
+`ask` is a word yeet owns, so it gets a guarantee: **it never boots a VM as its first move.**
+`yeet ask "<question>"` with no `--name` searches every agent from disk — instantly, free, and
+offline. Naming an agent *and* passing a question stays the only path under `ask` that spends
+money, because a missing flag must never turn into a fan-out across every agent you own.
+
+Locally that search is **lexical, over tasks and `iter-NNN/summary.md`**, and that is a choice
+rather than a shortcut. The whole local corpus is tens of KiB; the summary is already the
+agent's own answer to "what did you build, and how do I run it." Semantic search needs an
+embedding model, which means a network call and a key, or model weights to load — either one
+contradicts *instant, free, and offline*, and buys nothing at a scale where scanning everything
+costs a millisecond. It would also be yeet's first dependency.
+
+**turbopuffer is for remote/cloud only**, where the corpus is session-scale, lives somewhere
+else, and lexical scanning stops being possible. The tier boundary is the corpus, not the
+feature: same question, different amount of data behind it. Nothing about the local path has to
+change when the cloud path arrives, because neither index is authoritative.
+
 ---
 
 ## Checkpoints, resume, and cloud
@@ -295,7 +314,8 @@ everything remote. The state decides where an agent lives; the interface only de
 2. Checkpoint recorded per iteration.
 3. `yeet merge` — `git merge-tree` for conflict detection, verify-in-sandbox on a clean merge,
    emitting the merge JSON with `conflicts: 0`.
-4. Session chunking + embeddings; the semantic half of conflict questions.
+4. Lexical cross-agent search over tasks and summaries — local, no VM, no dependency.
 5. Remote backends behind the same interface.
+6. Session chunking + embeddings in turbopuffer; cloud only, once the corpus outgrows a scan.
 
 Steps 1–3 are a working merge story with no cloud dependency at all.
