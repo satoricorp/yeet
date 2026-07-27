@@ -111,19 +111,25 @@ if [ "$YEET_RUN_AGENT" = "1" ]; then
   meta sessionMode "$([ -n "$RESUME" ] && echo continue || echo new)"
 
   A0=$(date +%s)
-  # Redirect, never pipe: `pi ... | tee` discards pi's exit code (a pipeline's status is the
-  # last command's, and tee always succeeds) — that is the spike's fabricated success signal.
   # stdin from /dev/null because pi -p otherwise blocks on the libkrun console device.
   # -e loads yeet's own tools (ask_user, set_verify) — see guest/yeet-tools.ts.
-  # stdbuf -oL: line-buffered, so agent.log fills as the agent works instead of at exit.
-  # Without it a stopped agent loses EVERYTHING — measured: 851 seconds of work, SIGTERM from
-  # the budget watchdog, and a 0-byte log, because pi's stdout is block-buffered when it is not
-  # a tty. That is exactly backwards: the runs that get stopped are the expensive, confusing
-  # ones you most need to read, and the next iteration's retry prompt has nothing to feed back.
+  # --mode json makes agent.log an NDJSON event stream rather than prose: tool_execution_start
+  # / _update / _end, message_update carrying text deltas, turn boundaries, and — invisible to
+  # yeet until now — auto_retry_* and compaction_*. Events are emitted AS THEY HAPPEN, which is
+  # what makes a live trace possible and what actually fixes the empty-log problem.
+  #
+  # stdbuf -oL was the previous attempt at that and could not work: in text mode pi prints only
+  # the final message, so there is nothing to line-buffer. Measured after the stdbuf fix landed,
+  # an agent that made 78 tool calls with 66 errors over three minutes and was then SIGTERMed
+  # still left a 0-byte log. The runs that get stopped are the expensive, confusing ones you
+  # most need to read. Keep stdbuf anyway — it is what flushes each event line promptly.
+  #
+  # Redirect, never pipe: `pi ... | tee` discards pi's exit code (a pipeline's status is the
+  # last command's, and tee always succeeds) — that is the spike's fabricated success signal.
   stdbuf -oL -eL \
-    pi -p "$(cat "$D/prompt.txt")" --model "$YEET_MODEL" -a $RESUME \
+    pi -p "$(cat "$D/prompt.txt")" --model "$YEET_MODEL" -a $RESUME --mode json \
     -e /yeet/bin/yeet-tools.ts \
-    > "$D/agent.log" 2>&1 < /dev/null &
+    > "$D/agent.raw.jsonl" 2>&1 < /dev/null &
   PI_PID=$!
 
   # STOP watchdog. The controller drops a STOP file when the budget cap is crossed or the
@@ -242,11 +248,36 @@ git status --porcelain -z > "$D/status.z" 2>/dev/null || : > "$D/status.z"
 meta endedAtEpoch "$(date +%s)"
 
 # ── publish ─────────────────────────────────────────────────────────────────────────────
+# Compact the event stream, LAST — after the verifier has run and immediately before DONE.
+# The host tails agent.raw.jsonl for the live trace, and deleting it the moment pi exits cut
+# the stream off mid-sentence; leaving it until here gives the host the whole test phase to
+# finish draining. DONE still comes after, so the sentinel stays the last thing written.
+#
+# Why compact at all: every message_update carries the whole partial message alongside its
+# delta, so streaming one reply costs O(n²) bytes. Measured on one short iteration — 2414 KiB
+# of log, of which 2296 KiB was 468 message_update lines growing from 892 B to 20 KB apiece,
+# against a 31 KiB session JSONL for the same run.
+#
+# Those events matter only while they are arriving. Afterwards nothing reads them again: the
+# final text is in message_end and the whole transcript is in agent_end. Dropping them leaves
+# 4% of the bytes and loses nothing recoverable.
+#
+# grep, because the guest has no jq: "type" is always the first key, verified across every
+# event kind pi emits. The `|| :` is load-bearing — grep exits 1 when it matches nothing (an
+# agent killed before its first event), and this script runs under set -o pipefail.
+if [ -f "$D/agent.raw.jsonl" ]; then
+  grep -v '^{"type":"message_update"' "$D/agent.raw.jsonl" > "$D/agent.log" 2>/dev/null || :
+  meta agentLogRawBytes "$(wc -c < "$D/agent.raw.jsonl" | tr -d ' ')"
+  rm -f "$D/agent.raw.jsonl"
+fi
+meta agentLogBytes "$(wc -c < "$D/agent.log" 2>/dev/null | tr -d ' ' || echo 0)"
+
 # Atomic renames within one filesystem, meta before DONE, so the host never observes a
 # half-written result. DONE is the host's validity check.
 sync
 mv "$D/meta.kv.tmp" "$D/meta.kv"
 sync
+
 : > "$D/DONE.tmp"
 mv "$D/DONE.tmp" "$D/DONE"
 sync

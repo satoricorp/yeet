@@ -27,6 +27,7 @@
 import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { findSessionFile, readSession, costDelta } from "./session";
+import { EventTail } from "./trace";
 import type { VmWatcher } from "./vm";
 
 export type AskRequest = {
@@ -63,6 +64,14 @@ export type BridgeOpts = {
   onVerify: (v: VerifyRequest) => Promise<VerifyDecision>;
   /** Informational: the bridge dropped STOP or killed the VM. */
   onEscalate?: (action: "stop" | "kill", reason: "budget" | "stall") => void;
+  /** pi's event stream as it arrives, for the live trace. It rides this ticker rather than
+   *  starting its own: the loop already polls this same shared directory every 750ms, and a
+   *  second timer over the same virtiofs mount would only double the I/O. */
+  onAgentEvent?: (events: any[]) => void;
+  /** The VM has exited and no further events are coming. The renderer needs this to close a
+   *  half-written streaming line — the guest compacts and deletes the raw log before the VM
+   *  shuts down, so "the file went away" cannot be used as the signal. */
+  onAgentEnd?: () => void;
   tickMs?: number;
 };
 
@@ -79,6 +88,7 @@ export class Bridge implements VmWatcher {
   private lastSizes = new Map<string, number>();
   private answered = new Set<string>();
   private sessionBase: { file: string | null; costUsd: number } | null = null;
+  private tail: EventTail | null = null;
 
   constructor(private opts: BridgeOpts) {}
 
@@ -96,6 +106,12 @@ export class Bridge implements VmWatcher {
   stop(): void {
     if (this.timer) clearInterval(this.timer);
     this.timer = null;
+    // One last read. The guest keeps writing between the final tick and the VM exiting, and
+    // the tail end is the part worth seeing — agent_end, the closing message, and whatever a
+    // stopped agent managed to emit before it was killed. Without this the live trace loses
+    // its last up-to-750ms and leaves a half-written line for the next printer to collide with.
+    this.drainAgentEvents();
+    this.opts.onAgentEnd?.();
   }
 
   private async tick(): Promise<void> {
@@ -104,6 +120,7 @@ export class Bridge implements VmWatcher {
     try {
       const pending = this.scanQa();
       for (const file of pending) await this.answer(file);
+      this.drainAgentEvents();
       this.observeActivity();
       this.checkBudget();
       this.checkStall(pending.length > 0);
@@ -116,6 +133,15 @@ export class Bridge implements VmWatcher {
 
   private qaDir(): string {
     return join(this.opts.iterDir, "qa");
+  }
+
+  /** Forward whatever pi has written since the last tick. Constructed lazily because the file
+   *  does not exist until the guest has started the agent. */
+  private drainAgentEvents(): void {
+    if (!this.opts.onAgentEvent) return;
+    this.tail ??= new EventTail(join(this.opts.iterDir, "agent.raw.jsonl"));
+    const events = this.tail.drain();
+    if (events.length) this.opts.onAgentEvent(events);
   }
 
   private scanQa(): string[] {

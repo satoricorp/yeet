@@ -17,7 +17,7 @@
  * every duration as NaN and renders as a blank rather than an error. Everything here goes
  * through `ms()`, which accepts both.
  */
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync, openSync, readSync, closeSync } from "node:fs";
 import { join } from "node:path";
 import { readMeta, num, type Meta, type Phase } from "./contract";
 
@@ -79,6 +79,85 @@ export type Stats = {
 };
 
 export type PhaseTrace = { win: Window; turns: Turn[]; calls: ToolCall[]; stats: Stats };
+
+/**
+ * Follow pi's event stream while it is still being written.
+ *
+ * Offset-based rather than re-reading: the raw stream reaches megabytes on a normal iteration
+ * (every message_update repeats the whole partial message), and re-parsing it on a 750ms tick
+ * would be quadratic work on a quadratic file.
+ *
+ * The final line is routinely torn — the host reads whenever it likes, and the guest is
+ * mid-write — so an incomplete tail is carried to the next drain rather than discarded. Losing
+ * it would silently drop one event per read.
+ */
+export class EventTail {
+  private offset = 0;
+  private carry = "";
+
+  constructor(private path: string) {}
+
+  /** Every complete event appended since the last call. Never throws. */
+  drain(): any[] {
+    let fd: number | null = null;
+    try {
+      const size = statSync(this.path).size;
+      // Truncated or replaced underneath us: start over rather than read from a stale offset.
+      if (size < this.offset) { this.offset = 0; this.carry = ""; }
+      if (size === this.offset) return [];
+
+      fd = openSync(this.path, "r");
+      const buf = Buffer.allocUnsafe(size - this.offset);
+      const read = readSync(fd, buf, 0, buf.length, this.offset);
+      this.offset += read;
+
+      const text = this.carry + buf.subarray(0, read).toString("utf8");
+      const lines = text.split("\n");
+      this.carry = lines.pop() ?? ""; // incomplete; it will be whole next time
+
+      const out: any[] = [];
+      for (const l of lines) {
+        if (!l.trim()) continue;
+        try { out.push(JSON.parse(l)); } catch { /* a genuinely malformed line is not fatal */ }
+      }
+      return out;
+    } catch {
+      return []; // the file may not exist yet — the agent has not started writing
+    } finally {
+      if (fd !== null) try { closeSync(fd); } catch { /* nothing useful to do */ }
+    }
+  }
+}
+
+/**
+ * The agent's closing prose, from whichever shape its log is in.
+ *
+ * agent.log used to be pi's `text` output — the final message and nothing else. It is now an
+ * NDJSON event stream, where that same text lives inside the last `message_end` carrying an
+ * assistant role. Both are read, because every agent that ran before the switch still has the
+ * old shape on disk and is still worth finding.
+ *
+ * Detection is by content, not by a version field: a log that starts with `{"type":"` is the
+ * event stream. Prose never does.
+ */
+export function finalText(log: string): string | null {
+  const trimmed = log.trim();
+  if (!trimmed) return null;
+  if (!trimmed.startsWith('{"type":')) return trimmed; // the old prose format
+
+  let out: string | null = null;
+  for (const line of trimmed.split("\n")) {
+    if (!line.startsWith('{"type":"message_end"')) continue; // cheap reject before parsing
+    let e: any;
+    try { e = JSON.parse(line); } catch { continue; }
+    if (e?.message?.role !== "assistant") continue;
+    const text = (e.message.content ?? [])
+      .filter((c: any) => c?.type === "text" && typeof c.text === "string")
+      .map((c: any) => c.text).join("\n").trim();
+    if (text) out = text;
+  }
+  return out;
+}
 
 /** ISO-8601 or epoch-millis, both of which occur in the same record. */
 export function ms(v: unknown): number | null {

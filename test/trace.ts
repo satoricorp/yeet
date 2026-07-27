@@ -10,7 +10,10 @@
  *
  *   bun test/trace.ts
  */
-import { ms, describe as describeCall, errorSig, parseEntries, summarize, relPath, stripGuestPaths } from "../src/trace";
+import { ms, describe as describeCall, errorSig, parseEntries, summarize, relPath, stripGuestPaths, finalText, EventTail } from "../src/trace";
+import { writeFileSync, appendFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 let failures = 0;
 const check = (label: string, ok: boolean, detail = "") => {
@@ -171,6 +174,69 @@ console.log("\n\x1b[36m▪\x1b[0m malformed input");
   const src = [JSON.stringify(turn(0, [])), '{"type":"mess'];
   check("a torn final line is skipped, not thrown", parseEntries(src).length === 1);
   check("blank lines are ignored", parseEntries(["", "  ", JSON.stringify(turn(0, []))]).length === 1);
+}
+
+console.log("\n\x1b[36m▪\x1b[0m the agent's closing prose, in either log format");
+{
+  // agent.log was prose before pi ran in --mode json, and every agent that ran under the old
+  // shape is still on disk and still worth finding.
+  check("old prose passes through", finalText("Built a thing.\nIt works.") === "Built a thing.\nIt works.");
+
+  const ev = (role: string, text: string) =>
+    JSON.stringify({ type: "message_end", message: { role, content: [{ type: "text", text }] } });
+  const stream = [
+    JSON.stringify({ type: "session", version: 3 }),
+    ev("user", "do the thing"),
+    ev("assistant", "First pass."),
+    JSON.stringify({ type: "message_end", message: { role: "toolResult", content: [{ type: "text", text: "tool output" }] } }),
+    ev("assistant", "Done. It works."),
+  ].join("\n");
+
+  check("text is extracted from the event stream", finalText(stream) === "Done. It works.", finalText(stream) ?? "null");
+  check("the LAST assistant message wins", !String(finalText(stream)).includes("First pass"));
+  check("tool results are not mistaken for the agent's words", !String(finalText(stream)).includes("tool output"));
+  check("an empty log is null, not empty string", finalText("   ") === null);
+  check("a stream with no assistant text is null", finalText(JSON.stringify({ type: "agent_start" })) === null);
+}
+
+console.log("\n\x1b[36m▪\x1b[0m following a log that is still being written");
+{
+  const tmp = join(tmpdir(), `yeet-tail-${process.pid}.jsonl`);
+  try {
+    writeFileSync(tmp, "");
+    const tail = new EventTail(tmp);
+    check("an empty file yields nothing", tail.drain().length === 0);
+
+    writeFileSync(tmp, '{"type":"a"}\n{"type":"b"}\n');
+    const first = tail.drain();
+    check("complete lines are returned", first.length === 2 && first[1]!.type === "b");
+    check("already-seen lines are not returned twice", tail.drain().length === 0);
+
+    // The guest writes while the host reads, so the last line is routinely half-written.
+    appendFileSync(tmp, '{"type":"c"}\n{"type":"par');
+    const second = tail.drain();
+    check("a torn final line is withheld", second.length === 1 && second[0]!.type === "c");
+
+    appendFileSync(tmp, 'tial"}\n');
+    const third = tail.drain();
+    check("and delivered once it completes", third.length === 1 && third[0]!.type === "partial",
+      JSON.stringify(third));
+
+    // Truncated or replaced underneath us: reading from a stale offset would return garbage.
+    writeFileSync(tmp, '{"type":"fresh"}\n');
+    const after = tail.drain();
+    check("a truncated file restarts from zero", after.length === 1 && after[0]!.type === "fresh");
+
+    check("malformed JSON is skipped, not thrown", (() => {
+      appendFileSync(tmp, "not json at all\n{\"type\":\"ok\"}\n");
+      const r = tail.drain();
+      return r.length === 1 && r[0]!.type === "ok";
+    })());
+  } finally {
+    rmSync(tmp, { force: true });
+  }
+  check("a missing file yields nothing rather than throwing",
+    new EventTail(join(tmpdir(), "yeet-does-not-exist.jsonl")).drain().length === 0);
 }
 
 console.log(failures === 0 ? "\n\x1b[32mall checks passed\x1b[0m" : `\n\x1b[31m${failures} failed\x1b[0m`);

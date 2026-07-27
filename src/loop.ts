@@ -48,6 +48,11 @@ export type IterationIo = {
    *  at the terminal, and whether they changed what the agent proposed. */
   verifyProposal(v: VerifyRequest): Promise<VerifyDecision & { approvedBy?: "user" | "auto"; changedOnApproval?: boolean }>;
   escalate?(action: "stop" | "kill", reason: "budget" | "stall"): void;
+  /** pi's events as they arrive, for the live trace. Optional: only the terminal renderer
+   *  wants them, and machine mode must never have prose streamed into its NDJSON. */
+  agentEvent?(events: any[]): void;
+  /** No more events are coming. Lets a streaming renderer close its last line. */
+  agentEventsDone?(): void;
 };
 
 const AUTO_IO: IterationIo = {
@@ -205,6 +210,8 @@ export async function runIteration(
       return decision;
     },
     onEscalate: (action, reason) => io.escalate?.(action, reason),
+    onAgentEvent: io.agentEvent ? (events) => io.agentEvent!(events) : undefined,
+    onAgentEnd: io.agentEventsDone ? () => io.agentEventsDone!() : undefined,
   });
 
   const rootfs = join(dir, "rootfs");

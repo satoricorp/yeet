@@ -11,7 +11,7 @@
  * — and escape codes in the middle of a grep pattern make that fail confusingly.
  */
 import type { Agent } from "./agent";
-import { stripGuestPaths, type PhaseTrace, type ToolCall } from "./trace";
+import { stripGuestPaths, describe, type PhaseTrace, type ToolCall } from "./trace";
 import { num, bool } from "./contract";
 
 const TTY = Boolean(process.stdout.isTTY) && !process.env.NO_COLOR;
@@ -144,6 +144,105 @@ export function renderTrace(agent: Agent, phases: PhaseTrace[], opts: { calls?: 
   console.log(S.dim(`  ${dur(wall * 1000)} wall · model ${dur(model)} (${wall ? Math.round(model / 10 / wall) : 0}%) · tool ${dur(tool)} (${wall ? Math.round(tool / 10 / wall) : 0}%)`));
   if (agent.coverage) console.log(S.dim(`  coverage ${agent.coverage.pct}% (${agent.coverage.coveredLines}/${agent.coverage.totalLines} lines)`));
   if (opts.dir) console.log(S.dim(`  ${opts.dir}`));
+}
+
+/**
+ * The live trace — pi's events rendered as they arrive.
+ *
+ * Strictly append-only: no cursor movement, no redraw. A terminal that is being piped, resized,
+ * or scrolled cannot be rewritten safely, and the moment this tries it stops composing with
+ * everything else the run prints. That is also why runs of identical calls are NOT folded here
+ * the way the replay view folds them — you cannot collapse rows you have already emitted.
+ *
+ * Only text deltas are streamed, not thinking deltas: thinking is long, arrives in bulk, and
+ * would bury the tool calls that are the point of watching.
+ */
+export class LiveTrace {
+  private open = new Map<string, { tool: string; target: string; at: number }>();
+  private streaming = false;
+  private col = 0;
+  private readonly w = cols();
+
+  feed(events: any[]): void {
+    for (const e of events) this.one(e);
+  }
+
+  /** Close any half-written text line. Called before a row and at the end of a phase. */
+  endText(): void {
+    if (this.streaming) { process.stdout.write("\n"); this.streaming = false; this.col = 0; }
+  }
+
+  private one(e: any): void {
+    switch (e?.type) {
+      case "message_update": {
+        const d = e.assistantMessageEvent;
+        if (d?.type !== "text_delta" || typeof d.delta !== "string") return;
+        this.text(d.delta);
+        return;
+      }
+      case "tool_execution_start": {
+        this.endText();
+        const { target } = describe(e.toolName, e.args);
+        this.open.set(e.toolCallId, { tool: e.toolName, target, at: Date.now() });
+        const name = String(e.toolName).padEnd(11);
+        console.log(`⏺ ${S.bold(name)}${clip(target, this.w - 13)}`);
+        return;
+      }
+      case "tool_execution_end": {
+        this.endText();
+        const started = this.open.get(e.toolCallId);
+        const wasAlone = this.open.size <= 1;
+        this.open.delete(e.toolCallId);
+        const ms = started ? Date.now() - started.at : null;
+        const text = typeof e.result === "string" ? e.result
+          : (e.result?.output ?? e.result?.content?.[0]?.text ?? "");
+        const all = String(text).split("\n").filter((l: string) => l.trim() !== "");
+        const head = stripGuestPaths(all[0] ?? "(no output)").replace(/\s+/g, " ");
+        // Calls can overlap — two writes started before either finished — and append-only
+        // output cannot put the result back under its own row. Name the call it answers
+        // whenever more than one was in flight, or the results read as belonging to the
+        // wrong tool.
+        const label = wasAlone || !started ? "" : `${started.tool} ${clip(started.target, 24)} → `;
+        const right = [dur(ms != null && ms >= 200 ? ms : null), all.length > 1 ? `+${all.length - 1} lines` : ""]
+          .filter(Boolean).join("  ");
+        const budget = Math.max(10, this.w - 5 - label.length - (right ? right.length + 2 : 0));
+        const body = `${label}${clip(head, budget)}${right ? `  ${right}` : ""}`;
+        console.log(`  ${S.dim("⎿")}  ${e.isError ? S.red(body) : S.dim(body)}`);
+        return;
+      }
+      // The agent has stopped talking; close any half-written line so whatever the loop prints
+      // next starts on its own row.
+      case "message_end":
+      case "agent_end":
+      case "agent_settled":
+        this.endText();
+        return;
+      // Both were invisible to yeet before the event stream, and both explain a slow or
+      // expensive run that otherwise looks like the model simply being slow.
+      case "auto_retry_start":
+        this.endText();
+        console.log(S.yellow(`  ↻ retry ${e.attempt}/${e.maxAttempts} in ${e.delayMs}ms — ${clip(String(e.errorMessage ?? ""), 60)}`));
+        return;
+      case "compaction_start":
+        this.endText();
+        console.log(S.yellow(`  ⧉ compacting context (${e.reason})`));
+        return;
+      case "turn_start":
+        this.endText();
+        return;
+    }
+  }
+
+  /** Wrap by hand — the delta arrives in fragments, so there is no line to measure. */
+  private text(delta: string): void {
+    if (!this.streaming) { process.stdout.write("  "); this.col = 2; this.streaming = true; }
+    for (const ch of delta) {
+      if (ch === "\n") { process.stdout.write("\n  "); this.col = 2; continue; }
+      if (this.col >= this.w - 1) { process.stdout.write("\n  "); this.col = 2; }
+      process.stdout.write(TTY ? `\x1b[2m${ch}\x1b[0m` : ch);
+      this.col++;
+    }
+  }
 }
 
 /** Search results, developer register: score, matched terms, provenance, paths. */

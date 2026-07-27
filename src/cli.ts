@@ -40,7 +40,7 @@ import { reviewWorkspace } from "./review";
 import { analyze, apply, publish } from "./merge";
 import { search, searchLines, lastActive, ago } from "./search";
 import { readTrace } from "./trace";
-import { renderTrace, renderSearchSmarty } from "./smarty";
+import { renderTrace, renderSearchSmarty, LiveTrace } from "./smarty";
 
 const EXIT = { passed: 0, usage: 1, stalled: 2, capped: 3, failed: 4, unverified: 5 } as const;
 
@@ -103,7 +103,13 @@ function makeUi(flags: Flags): Ui {
 }
 
 function ioFor(ui: Ui): IterationIo {
+  // The live trace is a smarty-only surface. pleb mode is deliberately quiet while an agent
+  // works, and machine mode must never have prose streamed into its NDJSON — a partial text
+  // delta on stdout would corrupt the line protocol for anything parsing it.
+  const live = ui.mode === "smarty" ? new LiveTrace() : null;
   return {
+    agentEvent: live ? (events) => live.feed(events) : undefined,
+    agentEventsDone: live ? () => live.endText() : undefined,
     ask: async (q) => (await ui.ask(q)).answer,
     verifyProposal: async (v) => {
       const d = await ui.verifyProposal(v);

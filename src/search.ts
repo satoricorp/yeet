@@ -22,6 +22,7 @@
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import * as store from "./agent";
+import { finalText } from "./trace";
 
 /** Field weights. The name and task are the user's OWN words and are short, so a hit there says
  *  more than a hit buried in generated prose. The summary is richer but far longer. */
@@ -123,7 +124,10 @@ export function latestProse(name: string): { text: string; source: Source } | nu
     for (const sub of subdirs) {
       const p = join(dir, sub, file);
       if (!existsSync(p)) continue;
-      const text = readFileSync(p, "utf8").trim();
+      const raw = readFileSync(p, "utf8");
+      // agent.log is now pi's NDJSON event stream, and was prose before that. finalText reads
+      // both, so agents that ran under either shape stay findable.
+      const text = (file === "summary.md" ? raw.trim() : finalText(raw)) ?? "";
       if (text) return { text: text.slice(0, MAX_PROSE), source: file === "summary.md" ? "summary" : "answer" };
     }
   }
