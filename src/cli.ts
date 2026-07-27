@@ -39,6 +39,8 @@ import { checkCounts, checkCheats, implementationFiles, failureSignature } from 
 import { reviewWorkspace } from "./review";
 import { analyze, apply, publish } from "./merge";
 import { search, searchLines, lastActive, ago } from "./search";
+import { readTrace } from "./trace";
+import { renderTrace, renderSearchSmarty } from "./smarty";
 
 const EXIT = { passed: 0, usage: 1, stalled: 2, capped: 3, failed: 4, unverified: 5 } as const;
 
@@ -692,6 +694,13 @@ function cmdFind(question: string | undefined, ui: Ui): number {
   const strong = hits.filter((h) => h.matched.length === most).slice(0, 4);
   const also = hits.filter((h) => h.matched.length < most).slice(0, 3);
 
+  // smarty gets the ranking itself — score, which terms landed, where the prose came from, and
+  // the path to go read. No voice: someone in this mode is checking whether the ranker is right.
+  if (ui.mode === "smarty") {
+    renderSearchSmarty(hits, agents.length, (n) => store.agentDir(n));
+    return 0;
+  }
+
   const vox = searchLines(loadConfig().voice);
   const byName = new Map(agents.map((a) => [a.name, a]));
   const now = Date.now();
@@ -763,30 +772,18 @@ async function cmdAsk(name: string, question: string | undefined, ui: Ui, capUsd
     // run it. The dossier — model, verify command, frozen fingerprints, per-iteration table —
     // is for someone debugging yeet, so it lives behind --smarty.
     console.log("");
+    // The old smarty view was a denser restatement of the pleb one — the same summary with more
+    // columns. What someone debugging an agent actually wants is the trace: which tools ran, in
+    // what order, what came back, and where the time and tokens went. All of it is already on
+    // disk in the session JSONL and each phase's meta.kv; none of it was being read.
     if (ui.mode === "smarty") {
-      console.log(`${C.bold(agent.name)}  ${C.dim(`(${agent.state})`)}`);
-      console.log(`${C.dim("task")}     ${agent.task}`);
-      console.log(`${C.dim("model")}    ${agent.model}`);
-      console.log(`${C.dim("origin")}   ${agent.origin ?? "none — isolated"}`);
-      console.log(`${C.dim("verify")}   ${v ? `${v.command} ${C.dim(`(${v.source})`)}` : "never registered"}`);
-      if (v?.coverageCommand) console.log(`${C.dim("coverage")} ${v.coverageCommand}${agent.coverage ? ` → ${agent.coverage.pct}% (${agent.coverage.coveredLines}/${agent.coverage.totalLines} lines)` : ""}`);
-      if (v && Object.keys(v.frozen).length) console.log(`${C.dim("frozen")}   ${Object.keys(v.frozen).length} pre-existing test file(s) fingerprinted`);
-      console.log(`${C.dim("branch")}   ${agent.branch}`);
-      console.log(`${C.dim("cost")}     ${usd(agent.costUsd)} over ${agent.iterations.length} iteration(s)`);
-      if (agent.iterations.length) {
-        console.log("");
-        for (const it of agent.iterations) {
-          const verdict = it.verdict === "green" ? C.green("green") : it.verdict === "red" ? C.red(`red · exit ${it.testExit}`) : C.dim("no verifier");
-          const flags = `${it.touchedFrozenTests ? C.yellow(" tests-touched") : ""}${it.stopReason ? C.yellow(` stopped:${it.stopReason}`) : ""}`;
-          console.log(` ${String(it.n).padStart(2)}  ${dur(it.agentSeconds).padEnd(8)}${usd(it.costUsd).padEnd(9)}${(it.treeChanged ? `+${it.insertions} −${it.deletions} ${it.filesChanged}f` : "no edit").padEnd(18)}${verdict}${flags}`);
-        }
+      const dir = store.agentDir(agent.name);
+      const phases = readTrace(dir, join(dir, "session"));
+      if (!phases.length) {
+        console.log(`${C.bold(agent.name)} ${C.dim(agent.state)} — no phases recorded yet.`);
+        return 0;
       }
-      if (summary) {
-        console.log("");
-        console.log(`${C.dim("in its own words:")} ${summary}`);
-      }
-      console.log("");
-      console.log(C.dim(`artifacts: ${store.agentDir(agent.name)}`));
+      renderTrace(agent, phases, { dir });
       return 0;
     }
 
@@ -1130,7 +1127,7 @@ forgotten --name can never turn into a question asked of every agent you own.
   yeet config --name <n> <s> <v>    set one on that agent
 
 yours
-  smarty on|off       developer detail everywhere, not only when you pass --smarty
+  smarty on|off       the trace view everywhere, not only when you pass --smarty
   voice ${VOICES.join("|")}
   model <p/m>         which model new agents use              now: ${model}
   budget <dollars>    spend ceiling for one run               now: ${usd(cost)}
@@ -1180,7 +1177,7 @@ run this.
   --rename <new>   yeet --name <old> --rename <new>
   --model <p/m>    ${model}
   --max-cost USD   ${cost}          --max-iter N   ${iter}
-  --smarty         developer detail for this run
+  --smarty         the trace: tool calls, exit codes, tokens, latency
   --yes            don't wait for answers — take the agent's recommendations
   --agent          machine mode: JSON lines on stdout, nothing else
 
