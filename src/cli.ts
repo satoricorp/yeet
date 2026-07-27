@@ -38,7 +38,7 @@ import { record } from "./events";
 import { checkCounts, checkCheats, implementationFiles, failureSignature } from "./gates";
 import { reviewWorkspace } from "./review";
 import { analyze, apply, publish } from "./merge";
-import { search } from "./search";
+import { search, searchLines, lastActive, ago } from "./search";
 
 const EXIT = { passed: 0, usage: 1, stalled: 2, capped: 3, failed: 4, unverified: 5 } as const;
 
@@ -675,8 +675,11 @@ function cmdFind(question: string | undefined, ui: Ui): number {
   }
   if (!hits.length) {
     console.log("");
-    console.log(`nothing matches ${C.bold(question)}.`);
-    console.log(C.dim(`  ${agents.length} agent${agents.length === 1 ? "" : "s"} searched — yeet ls to see them all`));
+    console.log(searchLines(loadConfig().voice).nothing(agents.length));
+    console.log("");
+    console.log(C.dim("next"));
+    console.log(`  yeet ls                  ${C.dim("every agent you have")}`);
+    console.log(`  yeet "${question}"${" ".repeat(Math.max(1, 18 - question.length))}${C.dim("start one that will")}`);
     return 0;
   }
 
@@ -689,14 +692,32 @@ function cmdFind(question: string | undefined, ui: Ui): number {
   const strong = hits.filter((h) => h.matched.length === most).slice(0, 4);
   const also = hits.filter((h) => h.matched.length < most).slice(0, 3);
 
+  const vox = searchLines(loadConfig().voice);
+  const byName = new Map(agents.map((a) => [a.name, a]));
+  const now = Date.now();
+  // Pad the PLAIN name before colouring — padEnd counts ANSI escape bytes as width, so bolding
+  // first would break every column to its right by exactly the length of the escape.
+  const nw = Math.max(...strong.map((h) => h.name.length)) + 2;
+
   console.log("");
-  const one = strong.length === 1;
-  console.log(`${one ? "One agent looks" : `${strong.length} agents look`} related. ${C.dim(`I didn't ask ${one ? "it" : "them"} — this is what ${one ? "it" : "they"} wrote down.`)}`);
+  console.log(`${vox.found(strong.length, agents.length)} ${C.dim(vox.sourceNote)}`);
   console.log("");
   for (const h of strong) {
+    const a = byName.get(h.name);
     const status = h.state === "passed" ? "good" : h.state === "running" ? "running" : "failed";
     const paint = status === "good" ? C.green : status === "running" ? C.cyan : C.red;
-    console.log(`  ${C.bold(h.name)}  ${paint(status)}`);
+
+    // The facts a person weighs when choosing between two agents that both look right: is it
+    // finished, how hard was it, what did it cost, how stale is it, is any of it proven.
+    const t = lastActive(h.name);
+    const meta = [
+      a ? `${a.iterations.length} round${a.iterations.length === 1 ? "" : "s"}` : null,
+      a && a.costUsd > 0 ? plebMoney(a.costUsd) : null,
+      t ? ago(t, now) : null,
+      a?.coverage ? `${a.coverage.pct}% covered` : null,
+    ].filter(Boolean).join(" · ");
+
+    console.log(`  ${C.bold(h.name) + " ".repeat(nw - h.name.length)}${paint(status.padEnd(9))}${meta ? C.dim(meta) : ""}`);
     // plainText strips the markdown — summaries are written for a file, and raw backticks and
     // headings landing in a terminal look like a bug.
     console.log(`    ${C.dim(plainText(h.snippet ?? h.task, 300))}`);
@@ -704,9 +725,7 @@ function cmdFind(question: string | undefined, ui: Ui): number {
     console.log("");
   }
   if (also.length) {
-    const w = Math.max(...also.map((h) => h.name.length)) + 2;
-    console.log(C.dim("also mentions it"));
-    for (const h of also) console.log(C.dim(`  ${h.name.padEnd(w)}${plainText(h.snippet ?? h.task, 90)}`));
+    console.log(C.dim(`also mentions it: ${also.map((h) => h.name).join(", ")}`));
     console.log("");
   }
 
@@ -718,12 +737,12 @@ function cmdFind(question: string | undefined, ui: Ui): number {
   console.log(C.dim("next"));
   for (const [cmd, why] of steps) console.log(`  ${cmd.padEnd(cw)}${C.dim(why)}`);
   console.log("");
-  console.log(C.dim(`${agents.length} agents searched on disk · nothing was woken up`));
+  console.log(C.dim(vox.footer(agents.length)));
   return 0;
 }
 
 /** yeet ask --name <n> — the full story, free. With a question — a paid conversation. */
-async function cmdAsk(name: string, question: string | undefined, ui: Ui): Promise<number> {
+async function cmdAsk(name: string, question: string | undefined, ui: Ui, capUsd?: number): Promise<number> {
   if (!store.exists(name)) {
     ui.event({ event: "error", message: `no agent named "${name}" — see yeet ls` });
     return EXIT.usage;
@@ -803,7 +822,7 @@ async function cmdAsk(name: string, question: string | undefined, ui: Ui): Promi
       return EXIT.usage;
     }
     if (ui.mode !== "json") console.log(C.dim("asking… (one VM boot, a few cents)"));
-    const res = await runChat(agent, question, ioFor(ui));
+    const res = await runChat(agent, question, ioFor(ui), capUsd);
     if (!res.valid || !res.answer) {
       ui.event({ event: "error", message: `no answer came back${res.reason ? ` (${res.reason})` : ""}` });
       return EXIT.failed;
@@ -1243,7 +1262,7 @@ async function main(): Promise<number> {
   // no VM. Reaching here means an agent was named, which is the only form that can spend money.
   if (rest[0] === "ask") {
     const agent = named("ask");
-    return agent ? cmdAsk(agent.name, rest.slice(1).join(" ") || undefined, ui) : EXIT.usage;
+    return agent ? cmdAsk(agent.name, rest.slice(1).join(" ") || undefined, ui, flags.maxCost!) : EXIT.usage;
   }
 
   if (rest[0] === "rm") {

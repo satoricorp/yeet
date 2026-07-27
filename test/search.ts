@@ -10,7 +10,7 @@
  *
  *   bun test/search.ts
  */
-import { rank, type SearchDoc } from "../src/search";
+import { rank, searchLines, ago, type SearchDoc } from "../src/search";
 
 let failures = 0;
 const check = (label: string, ok: boolean, detail = "") => {
@@ -156,6 +156,36 @@ console.log("\n\x1b[36m▪\x1b[0m term coverage separates answers from noise");
   check("both full-coverage agents are strong hits", JSON.stringify(strong) === JSON.stringify(["a1", "a2"]), `got ${strong}`);
   check("the single-word match is not a strong hit",
     r.find((h) => h.name === "b1")!.matched.length < most);
+}
+
+console.log("\n\x1b[36m▪\x1b[0m the voice may shrug, the facts may not");
+{
+  // VOICE.md: "The three voices say the same facts. None of them may add, soften, or invent an
+  // outcome — a tone setting that changes what you believe happened is a bug, not a personality."
+  // So the count of agents searched has to survive every voice, including the one telling jokes.
+  const VOICES = ["default", "professional", "dad-jokes"];
+  for (const v of VOICES) {
+    const L = searchLines(v);
+    check(`${v}: says how many were searched when nothing matched`, L.nothing(16).includes("16"));
+    check(`${v}: says how many were searched in the footer`, L.footer(16).includes("16"));
+    check(`${v}: every line is non-empty`,
+      [L.found(2, 16), L.sourceNote, L.nothing(16), L.footer(16)].every((s) => s.trim().length > 0));
+  }
+  check("an unknown voice falls back rather than throwing", searchLines("nonsense").footer(3).includes("3"));
+  check("the footer always says nothing was woken",
+    VOICES.every((v) => /nothing|no sandbox|nobody/i.test(searchLines(v).footer(16))));
+}
+
+console.log("\n\x1b[36m▪\x1b[0m relative time");
+{
+  const now = 1_700_000_000_000;
+  const s = 1000, m = 60 * s, h = 60 * m, d = 24 * h;
+  check("seconds read as just now", ago(now - 30 * s, now) === "just now");
+  check("minutes", ago(now - 20 * m, now) === "20m ago");
+  check("hours", ago(now - 7 * h, now) === "7h ago");
+  check("days", ago(now - 3 * d, now) === "3d ago");
+  // Clock skew between writing the file and reading it must not produce "-1m ago".
+  check("a future timestamp does not go negative", ago(now + 5 * m, now) === "just now");
 }
 
 console.log("\n\x1b[36m▪\x1b[0m stability");

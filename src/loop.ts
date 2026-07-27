@@ -318,6 +318,14 @@ export async function runChat(
   agent: store.Agent,
   question: string,
   io: IterationIo,
+  /** Ceiling for THIS question. Without one the chat path runs uncapped: the live watchdog in
+   *  bridge.ts only fires when a budget is present, so an answer that never converges was
+   *  bounded by the stall detector and the two-hour wall clock and nothing else.
+   *
+   *  Measured from zero rather than from the agent's lifetime spend, because a question is its
+   *  own transaction — an agent that has already built a lot should not become unable to answer
+   *  a question about what it built. */
+  capUsd?: number,
 ): Promise<{ answer: string | null; costUsd: number; valid: boolean; reason?: string }> {
   const before = readSession(findSessionFile(join(store.agentDir(agent.name), "session")));
   const r = await runIteration(agent, {
@@ -328,6 +336,7 @@ export async function runChat(
     dirName: `chat-${Date.now().toString(36)}`,
     prompt: chatPrompt(agent, question),
     io,
+    budget: capUsd ? { capUsd, spentBeforeUsd: 0 } : undefined,
   });
   if (!r.valid) return { answer: null, costUsd: 0, valid: false, reason: r.invalidReason };
   return {

@@ -19,7 +19,7 @@
  * agent, and long summaries would outrank short precise tasks purely by length. IDF fixes the
  * first, length normalisation the second.
  */
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import * as store from "./agent";
 
@@ -64,6 +64,32 @@ export type Hit = {
 /** Where an agent's description came from. Shown to the user, because "this is the summary it
  *  wrote" and "this is the last thing it happened to say" deserve different amounts of trust. */
 export type Source = "summary" | "answer" | "task";
+
+/**
+ * When this agent was last doing something, in epoch ms.
+ *
+ * From the event log's mtime rather than a field, because IterationRecord carries no timestamp
+ * — the log is append-only and written on every event, so its mtime is the closest honest
+ * answer available. Falls back to agent.json, then gives up rather than guessing: "just now"
+ * on an agent from last week would be worse than saying nothing.
+ */
+export function lastActive(name: string): number | null {
+  for (const f of ["events.jsonl", "agent.json"]) {
+    try {
+      return statSync(join(store.agentDir(name), f)).mtimeMs;
+    } catch { /* try the next one */ }
+  }
+  return null;
+}
+
+/** "3h", "2d" — coarse on purpose. Nobody looking one up three days later cares about minutes. */
+export function ago(ms: number, now: number): string {
+  const s = Math.max(0, Math.round((now - ms) / 1000));
+  if (s < 90) return "just now";
+  if (s < 3600) return `${Math.round(s / 60)}m ago`;
+  if (s < 86400) return `${Math.round(s / 3600)}h ago`;
+  return `${Math.round(s / 86400)}d ago`;
+}
 
 /** A cap on how much prose one agent contributes. Logs run ~1–5 KiB today; a runaway one should
  *  not be able to dominate the index by sheer length. */
@@ -199,6 +225,58 @@ function bestSnippet(text: string, terms: Set<string>, max = 160): string | null
   const clean = best.replace(/\s+/g, " ");
   return clean.length > max ? clean.slice(0, max).replace(/\s+\S*$/, "") + "…" : clean;
 }
+
+/**
+ * What yeet says about a search.
+ *
+ * These belong in src/voice.ts with every other canned line, and should move there once the
+ * three-voice refactor is committed — today `lines()` exists only in an uncommitted working
+ * tree, and importing it from here would make search depend on code that is not in the
+ * repository. That is precisely the defect that left HEAD unable to start, so it is not a
+ * mistake worth making twice.
+ *
+ * The house rule holds regardless of where they live: all three voices report the SAME facts.
+ * Tone may shrug; the count may not change.
+ */
+export type SearchLines = {
+  /** The opener. `n` strong hits out of `scanned` agents. */
+  found: (n: number, scanned: number) => string;
+  /** Why these descriptions can be trusted, and what they are not: nobody was asked. */
+  sourceNote: string;
+  /** Searched everything, nothing was about that. */
+  nothing: (scanned: number) => string;
+  /** The closing reassurance: this cost nothing and woke nothing. */
+  footer: (scanned: number) => string;
+};
+
+const SEARCH_LINES: Record<string, SearchLines> = {
+  default: {
+    found: (n) =>
+      n === 1 ? "Just the one." :
+      n === 2 ? "Two of them, and they both have a claim to it." :
+      `${n} of them look right.`,
+    sourceNote: "I didn't ask anyone — this is what they wrote down.",
+    nothing: (scanned) => `Nothing. I read all ${scanned} of them and none are about that.`,
+    footer: (scanned) => `${scanned} agents, read straight off your disk. Nothing woke up.`,
+  },
+  professional: {
+    found: (n) => (n === 1 ? "1 matching agent." : `${n} matching agents.`),
+    sourceNote: "Matched against stored summaries. No agent was queried.",
+    nothing: (scanned) => `No matches across ${scanned} agents.`,
+    footer: (scanned) => `${scanned} agents searched locally. No sandbox was started.`,
+  },
+  "dad-jokes": {
+    found: (n) =>
+      n === 1 ? "Just the one. Easy call — I didn't even have to make a decision tree." :
+      `${n} of them fit. I'd pick a favourite, but I try not to play fa-voice-rites.`,
+    sourceNote: "I didn't ask them, I just read their notes. Very hands-off. Very re-mote.",
+    nothing: (scanned) => `Nothing doing. I read all ${scanned} and came back empty — a real null set.`,
+    footer: (scanned) => `${scanned} agents, all read locally. Nobody got booted.`,
+  },
+};
+
+export const searchLines = (voice: string = "default"): SearchLines =>
+  SEARCH_LINES[voice] ?? SEARCH_LINES.default!;
 
 /** Read the corpus off disk and rank it. The only part that touches the store. */
 export function search(query: string, agents: store.Agent[]): Hit[] {
