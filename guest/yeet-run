@@ -177,19 +177,27 @@ if [ "$YEET_PHASE" = "chat" ]; then
 fi
 
 # ── commit ──────────────────────────────────────────────────────────────────────────────
-# Exactly one commit per iteration, and ONLY in the agent phase — chat discards above, and
-# every other phase runs no agent. --soft keeps the tree byte-identical while collapsing any
-# commits the agent made on its own, so "the agent committed even though we told it not to"
-# is a non-event rather than a corrupted history.
+# One commit per iteration, and ONLY in the agent phase — chat discards above, and every other
+# phase runs no agent. --soft keeps the tree byte-identical while collapsing any commits the
+# agent made on its own, so "the agent committed even though we told it not to" is a non-event
+# rather than a corrupted history. The one iteration that must NOT be collapsed is a merge,
+# because there the shape of history IS the result.
 COMMITTED=0
 DIVERGED=0
 if [ "$YEET_PHASE" = "agent" ] && [ -n "$BEFORE_HEAD" ]; then
-  if git merge-base --is-ancestor "$BEFORE_HEAD" HEAD 2>/dev/null; then
-    git reset --soft "$BEFORE_HEAD"
-  else
+  if ! git merge-base --is-ancestor "$BEFORE_HEAD" HEAD 2>/dev/null; then
     # The agent did something exotic (checkout, hard reset). Committing on top preserves the
     # work; destroying it to force our shape would not.
     DIVERGED=1
+  elif [ -n "$(git rev-list --min-parents=2 -n 1 "$BEFORE_HEAD..HEAD" 2>/dev/null)" ]; then
+    # The agent merged a branch in, and a --soft reset would keep the resulting FILES while
+    # discarding the merge commit's second parent. The merged branch then stops being an
+    # ancestor, so git recomputes the merge from the original base and reports the IDENTICAL
+    # conflict next time — resolving it can never stick, however many times you hand it back.
+    # Ancestry beats tidiness: leave the agent's history exactly as it made it.
+    COMMITTED=1
+  else
+    git reset --soft "$BEFORE_HEAD"
   fi
   git add -A
   if ! git diff --cached --quiet; then

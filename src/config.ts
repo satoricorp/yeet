@@ -25,8 +25,10 @@ export type GlobalConfig = {
   /** Tone. Defaults to "default". */
   voice?: Voice;
   /** Spend ceiling for ONE invocation, enforced live during an iteration rather than only
-   *  between them. Per-run, not lifetime: each `yeet <name> "…"` gets this much. */
+   *  between them. Per-run, not lifetime: each `yeet --name <n> "…"` gets this much. */
   maxCostUsd?: number;
+  /** Branch a merge aims at. */
+  target?: string;
   /** How many times the agent may try before yeet calls it. */
   maxIterations?: number;
   /** Git URL or path new agents start with, so the common case (one repo you always push to)

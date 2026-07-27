@@ -37,6 +37,7 @@ import { costDelta, findSessionFile, readSession } from "./session";
 import { record } from "./events";
 import { checkCounts, checkCheats, implementationFiles, failureSignature } from "./gates";
 import { reviewWorkspace } from "./review";
+import { analyze, apply, publish } from "./merge";
 
 const EXIT = { passed: 0, usage: 1, stalled: 2, capped: 3, failed: 4, unverified: 5 } as const;
 
@@ -490,6 +491,97 @@ function cmdLs(ui: Ui): number {
 }
 
 /**
+ * yeet --name <n> merge — combine an agent's work with the branch it was built against.
+ *
+ * Detects before touching anything: merge-tree does a full three-way merge against the object
+ * store, so a conflicted merge costs nothing and leaves no half-merged worktree behind. A clean
+ * merge is then VERIFIED in a sandbox before publishing, because two changes can merge without
+ * one conflicting line and still break each other — the failure a textual merge cannot see, and
+ * the only reason a VM belongs in this path at all.
+ */
+async function cmdMerge(agent: store.Agent, flags: Flags, ui: Ui): Promise<number> {
+  const target = loadConfig().target ?? "main";
+  const lock = tryLock(`${store.agentDir(agent.name)}/.lock`);
+  if (!lock) { ui.event({ event: "error", message: `${agent.name} is busy right now` }); return EXIT.usage; }
+
+  try {
+    const r = analyze(agent, target);
+    const evt = (result: "clean" | "conflicted" | "resolved" | "aborted", conflicts: number, mergeCommit: string | null) =>
+      record(agent.name, {
+        kind: "merge", targetBranch: target, mergeBase: r.mergeBase ?? "", targetCommit: r.targetCommit ?? "",
+        agentCommit: r.agentCommit ?? "", result, conflicts, mergeCommit,
+      });
+
+    if (r.result === "no_origin") {
+      ui.event({ event: "error", message: `${agent.name} has nowhere to merge to — yeet config --name ${agent.name} origin <url>` });
+      return EXIT.usage;
+    }
+    if (r.result === "unreachable") {
+      ui.event({ event: "error", message: `could not reach ${agent.origin} — does ${target} exist there?` });
+      return EXIT.failed;
+    }
+    if (r.result === "up_to_date") {
+      ui.event({ event: "info", message: `already in ${target}. Nothing to do.` });
+      return EXIT.passed;
+    }
+
+    if (r.result === "conflicted") {
+      evt("conflicted", r.conflicts.length, null);
+      if (ui.mode === "json") { console.log(JSON.stringify({ event: "merge", ...r })); return EXIT.failed; }
+      console.log("");
+      console.log(C.yellow(`it and ${target} both changed the same things, so I stopped before touching anything.`));
+      console.log("");
+      for (const f of r.conflicts) console.log(`  ${f}`);
+      console.log("");
+      console.log(C.dim("  nothing is half-merged — the branch is exactly as it was."));
+      console.log(C.dim(`  hand it back: yeet --name ${agent.name} "merge ${target} in and resolve the conflicts"`));
+      return EXIT.failed;
+    }
+
+    const applied = apply(agent, target);
+    if (!applied.ok) { ui.event({ event: "error", message: applied.detail }); return EXIT.failed; }
+
+    let verified: boolean | null = null;
+    if (agent.verify) {
+      if (ui.mode !== "json") console.log(C.dim("merged cleanly — checking the combination actually works…"));
+      const check = await runIteration(agent, { n: 0, phase: "confirm", runAgent: false, runTest: true, dirName: "merge-verify" });
+      verified = check.valid && check.verdict === "green";
+      record(agent.name, {
+        kind: "verify_run", reason: "manual", command: agent.verify.command,
+        exitCode: check.testExit ?? -1, passed: verified,
+      });
+      if (!verified) {
+        // Textually clean, semantically broken. Keep it local so it can be handed back.
+        evt("conflicted", 0, applied.commit);
+        if (ui.mode === "json") { console.log(JSON.stringify({ event: "merge", ...r, verified: false, mergeCommit: applied.commit })); return EXIT.failed; }
+        console.log("");
+        console.log(C.red("they merged without conflicts, but the result fails its own checks."));
+        console.log(C.dim("  two changes that are each fine and wrong together — exactly what a clean merge"));
+        console.log(C.dim(`  cannot tell you. Not published. Hand it back: yeet --name ${agent.name} "fix the merge"`));
+        return EXIT.failed;
+      }
+    }
+
+    const ok = flags.yes || ui.autoAnswer || (await ui.confirm(`  publish to ${target}?`));
+    const pushed = ok ? publish(agent, target) : { ok: false, detail: "not published" };
+    evt(pushed.ok ? "resolved" : "clean", 0, applied.commit);
+
+    if (ui.mode === "json") {
+      console.log(JSON.stringify({ event: "merge", ...r, mergeCommit: applied.commit, verified, published: pushed.ok }));
+      return EXIT.passed;
+    }
+    console.log("");
+    console.log(C.green(`${agent.name} is in ${target}.`));
+    if (verified === true) console.log(C.dim("  checks pass on the combined result"));
+    else if (verified === null) console.log(C.yellow("  nothing verified this — there was no check to run"));
+    console.log(pushed.ok ? C.dim(`  ${pushed.detail}`) : C.yellow(`  ${pushed.detail}`));
+    return EXIT.passed;
+  } finally {
+    lock.release();
+  }
+}
+
+/**
  * yeet --name <n> test — run the agent's own checks and show you the output.
  *
  * Exists because the alternative was telling people to cd into a path. Someone using yeet has
@@ -598,7 +690,6 @@ async function cmdAsk(name: string, question: string | undefined, ui: Ui): Promi
     console.log("");
     console.log(`  built    ${agent.iterations.length} round${agent.iterations.length === 1 ? "" : "s"}, ${plebMoney(agent.costUsd)}`);
     console.log(`  checked  ${v ? (last?.verdict === "green" ? "tests pass" : "tests are failing") : C.yellow("nothing verifies this")}${agent.coverage ? C.dim(` · ${agent.coverage.pct}% of the code covered`) : ""}`);
-
 
     const steps: Array<[string, string]> = [
       [`yeet --name ${agent.name} test`, "run its checks and show the output"],
@@ -964,6 +1055,7 @@ run this.
   yeet --name <n> "now do this"  give that agent more work
   yeet --name <n> test           run its checks and show you the output
   yeet --name <n> push           push its branch to origin (asks first)
+  yeet --name <n> merge          combine its work with your main branch
 
   yeet ls                        every agent and how it went
   yeet ask --name <n>            what one did, and questions about it
@@ -1082,6 +1174,7 @@ async function main(): Promise<number> {
     // words in a task, which is exactly the ambiguity that killed the positional name.
     if (rest.length === 1 && rest[0] === "test") return cmdTest(agent.name, ui);
     if (rest.length === 1 && rest[0] === "push") return cmdPush(agent, ui);
+    if (rest.length === 1 && rest[0] === "merge") return cmdMerge(agent, flags, ui);
     if (rest.length) return runAgentLoop(agent, flags, ui, rest.join(" "));
 
     ui.event({
@@ -1091,7 +1184,7 @@ async function main(): Promise<number> {
     return EXIT.usage;
   }
 
-  if (rest.length === 1 && (rest[0] === "test" || rest[0] === "push")) {
+  if (rest.length === 1 && (rest[0] === "test" || rest[0] === "push" || rest[0] === "merge")) {
     ui.event({ event: "error", message: `which agent? yeet --name <n> ${rest[0]} — see yeet ls` });
     return EXIT.usage;
   }
