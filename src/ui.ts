@@ -15,7 +15,8 @@
 import * as readline from "node:readline/promises";
 import type { AgentState } from "./agent";
 import type { AskRequest, VerifyRequest, VerifyDecision } from "./bridge";
-import { LINES, blameProvider, plebMoney, plebDuration, plainText } from "./voice";
+import { lines, blameProvider, plebMoney, plebDuration, plainText, type Lines } from "./voice";
+import type { Voice } from "./config";
 
 export const C = {
   dim: (s: string) => `\x1b[2m${s}\x1b[0m`,
@@ -49,11 +50,17 @@ export type UiEvent =
   | { event: "done"; state: AgentState; seconds: number; costUsd: number; note: string; branch: string; workspace: string; origin: string | null; summary: string | null; model: string; coveragePct: number | null };
 
 export class Ui {
+  /** The voice's phrasebook, resolved once. Machine mode never reads it. */
+  private readonly L: Lines;
+
   constructor(
     public readonly mode: Mode,
     /** Recommendations are taken without asking: --agent, --yes, or no TTY to ask at. */
     public readonly autoAnswer: boolean,
-  ) {}
+    voice: Voice = "default",
+  ) {
+    this.L = lines(voice);
+  }
 
   private out(line: string): void {
     console.log(line);
@@ -172,7 +179,7 @@ export class Ui {
       case "escalate":
         if (e.action === "stop" && e.reason === "budget") this.out(C.yellow("💸 budget cap hit mid-round — told it to wrap up; whatever's done gets kept."));
         else if (e.action === "stop") this.out(C.yellow("😴 no signs of life in there — told it to wrap up."));
-        else this.out(C.yellow(`🔌 ${LINES.stallKilled(e.detail)}`));
+        else this.out(C.yellow(`🔌 ${this.L.stallKilled(e.detail)}`));
         break;
       case "iteration": {
         const what = e.treeChanged
@@ -186,7 +193,7 @@ export class Ui {
         break;
       }
       case "confirmed":
-        this.out(e.ok ? `double-checked in a fresh sandbox — ${C.green("still passing")}.` : C.yellow(LINES.flaky));
+        this.out(e.ok ? `double-checked in a fresh sandbox — ${C.green("still passing")}.` : C.yellow(this.L.flaky));
         break;
       case "coverage":
         // Only worth saying when it is BAD news. A good number is the expectation, not an
@@ -207,11 +214,11 @@ export class Ui {
       case "done": {
         this.out("");
         const line =
-          e.state === "passed" ? C.green(LINES.passed)
-          : e.state === "failed" ? C.red(LINES.failed(blameProvider(e.model)))
-          : e.state === "stalled" ? C.yellow(LINES.stalled)
-          : e.state === "unverified" ? C.yellow(LINES.unverified)
-          : C.yellow(LINES.capped);
+          e.state === "passed" ? C.green(this.L.passed)
+          : e.state === "failed" ? C.red(this.L.failed(blameProvider(e.model)))
+          : e.state === "stalled" ? C.yellow(this.L.stalled)
+          : e.state === "unverified" ? C.yellow(this.L.unverified)
+          : C.yellow(this.L.capped);
         this.out(line);
         if (e.note) this.out(C.dim(`(${e.note})`));
 
@@ -229,14 +236,14 @@ export class Ui {
         // Always end with somewhere to go. Every line is a command you can paste. Widths are
         // computed rather than hand-padded, because the name length varies per agent.
         const steps: Array<[string, string]> = [
-          [`yeet ${name} "…"`, "keep building"],
+          [`yeet --name ${name} "…"`, "keep building"],
           // Deliberately NOT a path. Someone using yeet has an agent, not a filesystem — they
           // should never need to know there is a git repo or where it lives. yeet runs it.
-          [`yeet ${name} test`, "run its checks and show the output"],
-          [`yeet ask ${name}`, "what it did, in detail"],
+          [`yeet --name ${name} test`, "run its checks and show the output"],
+          [`yeet ask --name ${name}`, "what it did, in detail"],
           e.origin
-            ? [`yeet ${name} push`, `send the branch to ${e.origin}`]
-            : [`yeet ${name} config origin <url>`, "connect a repo, then push"],
+            ? [`yeet --name ${name} push`, `send the branch to ${e.origin}`]
+            : [`yeet config --name ${name} origin <url>`, "connect a repo, then push"],
         ];
         const w = Math.max(...steps.map(([cmd]) => cmd.length)) + 3;
         this.out("");
@@ -317,7 +324,7 @@ export class Ui {
         const banner = e.state === "passed" ? C.green("passed") : C.yellow(e.state);
         this.out("");
         this.out(`${banner} · ${dur(e.seconds)} · ${usd(e.costUsd)}${e.note ? ` · ${e.note}` : ""}${e.coveragePct !== null ? ` · cov ${e.coveragePct}%` : ""}`);
-        this.out(`${C.dim("branch")}  ${e.branch}${e.origin ? C.dim(`  (push: yeet <name> push → ${e.origin})`) : ""}`);
+        this.out(`${C.dim("branch")}  ${e.branch}${e.origin ? C.dim(`  (push: yeet --name <n> push → ${e.origin})`) : ""}`);
         this.out(`${C.dim("ws")}      ${e.workspace}`);
         break;
       }
