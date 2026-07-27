@@ -271,10 +271,11 @@ const SEARCH_LINES: Record<string, SearchLines> = {
   },
   "dad-jokes": {
     found: (n) =>
-      n === 1 ? "Just the one. Easy call — I didn't even have to make a decision tree." :
-      `${n} of them fit. I'd pick a favourite, but I try not to play fa-voice-rites.`,
+      n === 1 ? "Just the one. Needle located, haystack intact." :
+      `${n} of them fit. Not a needle in a haystack after all — a needle in an index.`,
     sourceNote: "I didn't ask them, I just read their notes. Very hands-off. Very re-mote.",
-    nothing: (scanned) => `Nothing doing. I read all ${scanned} and came back empty — a real null set.`,
+    nothing: (scanned) =>
+      `Nothing matched. I checked every branch and found nothing but leaves — all ${scanned} of them.`,
     footer: (scanned) => `${scanned} agents, all read locally. Nobody got booted.`,
   },
 };

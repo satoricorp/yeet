@@ -140,8 +140,9 @@ const VOICE_LINES: Record<Voice, Lines> = {
 
   "dad-jokes": {
     passed: "Nailed it. And I didn't even need a hammer — I'm a soft-ware guy.",
-    failed: (provider) => `Well, that went about as well as a screen door on a submarine. Not my fault — that one's on ${provider}.`,
-    stalled: "I kept going in circles. At this point I'm just a-round to nothing.",
+    failed: (provider) =>
+      `That failed. I had a pointer to the solution and it came back null — ${provider}'s model, not you.`,
+    stalled: "Stuck repeating myself. Stuck repeating myself. You see the problem, so I stopped.",
     capped: "I hit the budget. I'd keep going, but I'm a bit short on cents. Everything so far is saved.",
     unverified: "I built it, but there's no test to prove it. Trust me, I'm an engineer — which is exactly what you shouldn't do.",
     stallKilled: (detail) => `It went dead quiet in there. I pulled the plug — you could say I ended the process.${detail ? ` (${detail})` : ""}`,
@@ -151,7 +152,7 @@ const VOICE_LINES: Record<Voice, Lines> = {
     state: (state, model) => {
       switch (state) {
         case "passed": return "it works. Tested and a-proved.";
-        case "running": return "still cooking.";
+        case "running": return "still looping — deliberately, this time.";
         case "stalled": return "it got stuck. Happens to the best of us, and to this one.";
         case "capped": return "it ran out of budget. Cost it everything.";
         case "unverified": return "it built something. Whether it works is anyone's guess, including mine.";
