@@ -23,7 +23,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { AGENTS_DIR, CURRENT_IMAGE, LAUNCHER, YEET_HOME, tryLock } from "./host";
+import { AGENTS_DIR, sweepTrash, CURRENT_IMAGE, LAUNCHER, YEET_HOME, tryLock } from "./host";
 import * as store from "./agent";
 import {
   runIteration, runChat, runCoverage, firstPrompt, buildPrompt, retryPrompt, DEFAULT_LIMITS,
@@ -1440,6 +1440,9 @@ async function main(): Promise<number> {
     return EXIT.usage;
   }
   mkdirSync(AGENTS_DIR, { recursive: true });
+  // Clear rootfs trees a killed run left behind. Cheap, and the only thing standing between a
+  // few interrupted runs and half a gigabyte of orphaned clones.
+  sweepTrash();
 
   const cfg = loadConfig();
   const model = flags.model ?? cfg.model ?? DEFAULT_MODEL;

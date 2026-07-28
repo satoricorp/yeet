@@ -15,7 +15,7 @@
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { cloneTree, CURRENT_IMAGE } from "./host";
+import { cloneTree, discardTree, CURRENT_IMAGE } from "./host";
 import { writeRequest, readMeta, sawDone, num, bool, type Phase } from "./contract";
 import { runVM } from "./vm";
 import { Bridge, prepareQaDir, type AskRequest, type VerifyRequest, type VerifyDecision } from "./bridge";
@@ -231,7 +231,7 @@ export async function runIteration(
     },
     ["/usr/local/bin/yeet-init", "/yeet/bin/yeet-run"],
   );
-  rmSync(rootfs, { recursive: true, force: true });
+  discardTree(rootfs);
 
   const base: IterationResult = {
     n: opts.n, phase: opts.phase, dirName, valid: false, treeChanged: false, committed: false,

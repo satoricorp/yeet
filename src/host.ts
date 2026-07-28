@@ -16,7 +16,7 @@
  * pid check cannot match (pids roll over; a reboot invalidates them all).
  */
 import { dlopen, FFIType } from "bun:ffi";
-import { openSync, closeSync } from "node:fs";
+import { openSync, closeSync, existsSync, mkdirSync, readdirSync, renameSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -48,6 +48,44 @@ export type Lock = { release(): void };
 /** Take an exclusive non-blocking lock. Returns null if another process holds it — which is
  *  exactly the liveness signal GC needs: lock acquirable ⇒ the owner is gone, whatever the
  *  metadata claims. */
+/**
+ * Get rid of a cloned rootfs without making anyone wait for it.
+ *
+ * Deleting one is expensive and wildly asymmetric: measured 1754/1830/1914 ms to remove a tree
+ * that took 96/239/359 ms to clone, against a ~623 ms boot. Doing it synchronously after the VM
+ * exits put roughly two seconds of pure teardown on the critical path of EVERY vm — the build,
+ * the confirm run, coverage, test, run, and the merge check — where the user is sitting watching
+ * a finished agent.
+ *
+ * A rename is effectively free, so move it aside and let a detached process do the slow part.
+ * Deliberately not queueMicrotask: microtasks drain BEFORE the awaiting continuation resumes, so
+ * that would keep the whole cost on the critical path while looking like it had moved.
+ */
+export function discardTree(dir: string): void {
+  if (!existsSync(dir)) return;
+  try {
+    mkdirSync(TRASH_DIR, { recursive: true });
+    const doomed = join(TRASH_DIR, `${Date.now().toString(36)}-${Math.floor(performance.now() * 1000) % 1e6}`);
+    renameSync(dir, doomed);
+    // Detached and unref'd: yeet may exit long before rm finishes, and that is fine — anything
+    // left behind is swept by sweepTrash() on the next run.
+    Bun.spawn(["rm", "-rf", doomed], { stdio: ["ignore", "ignore", "ignore"] }).unref();
+  } catch {
+    // A rename across devices, or a trash dir we cannot make: fall back to paying the cost.
+    try { rmSync(dir, { recursive: true, force: true }); } catch { /* nothing left to try */ }
+  }
+}
+
+/** Clear anything a killed process left in the trash. Cheap, and bounded by how often yeet runs. */
+export function sweepTrash(): void {
+  if (!existsSync(TRASH_DIR)) return;
+  try {
+    for (const e of readdirSync(TRASH_DIR)) {
+      Bun.spawn(["rm", "-rf", join(TRASH_DIR, e)], { stdio: ["ignore", "ignore", "ignore"] }).unref();
+    }
+  } catch { /* best effort */ }
+}
+
 export function tryLock(path: string): Lock | null {
   const fd = openSync(path, "w");
   if (symbols.flock(fd, LOCK_EX | LOCK_NB) !== 0) {
@@ -66,6 +104,9 @@ export const YEET_HOME = process.env.YEET_HOME ?? join(homedir(), ".yeet");
 export const AGENTS_DIR = join(YEET_HOME, "agents");
 export const LAUNCHER = join(YEET_HOME, "bin", "yeet-vm");
 export const CURRENT_IMAGE = join(YEET_HOME, "images", "current");
+/** Where cloned rootfs trees go to die. Beside the agent dirs, never inside one — the agent dir
+ *  is mounted into the guest, so a doomed 563 MB tree in there would be visible to the agent. */
+export const TRASH_DIR = join(YEET_HOME, "trash");
 
 /** libkrun dlopen()s libkrunfw by leaf name at runtime, so it is invisible to otool -L and
  *  unreachable via -rpath (libkrunfw's install name is absolute). Every spawn of the
