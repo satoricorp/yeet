@@ -35,7 +35,7 @@ export const usd = (n: number) => (n === 0 ? "$0" : n < 0.01 ? `$${n.toFixed(4)}
 export type Mode = "pleb" | "smarty" | "json";
 
 export type UiEvent =
-  | { event: "start"; agent: string; task: string; resuming: boolean; model: string; origin: string | null; verify: string | null; maxIter: number; maxCostUsd: number; isNew: boolean }
+  | { event: "start"; agent: string; task: string; resuming: boolean; model: string; origin: string | null; verify: string | null; maxIter: number; maxCostUsd: number | null; isNew: boolean }
   | { event: "baseline"; verdict: "green" | "red" | "none"; testExit: number | null }
   | { event: "verify_bound"; command: string; testFiles: string[]; coverageCommand: string | null; source: "agent" | "user"; edited: boolean }
   | { event: "question"; id: string; question: string; options: string[]; recommended: string; why?: string }
@@ -151,7 +151,7 @@ export class Ui {
         this.out("");
         this.out(`  job      ${e.task}`);
         if (e.origin) this.out(`  repo     ${e.origin}`);
-        this.out(`  limits   ${e.maxIter} rounds or ${plebMoney(e.maxCostUsd)}`);
+        this.out(`  limits   ${e.maxIter} rounds${e.maxCostUsd ? ` or ${plebMoney(e.maxCostUsd)}` : ""}`);
         if (e.isNew) this.out(`  ${C.dim(`naming   I picked it. Pass --name next time if you'd rather choose.`)}`);
         this.out("");
         break;
@@ -269,7 +269,7 @@ export class Ui {
         this.out(`${C.dim("where")}   ${e.origin ?? "isolated workspace"}`);
         this.out(`${C.dim("model")}   ${e.model}`);
         this.out(`${C.dim("verify")}  ${e.verify ?? C.yellow("unset — the agent must register one (set_verify)")}`);
-        this.out(`${C.dim("limits")}  ${e.maxIter} iterations · ${usd(e.maxCostUsd)}`);
+        this.out(`${C.dim("limits")}  ${e.maxIter} iterations${e.maxCostUsd ? ` · ${usd(e.maxCostUsd)}` : " · no cap"}`);
         this.out("");
         break;
       case "baseline":

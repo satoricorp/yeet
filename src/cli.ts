@@ -26,7 +26,7 @@ import { join } from "node:path";
 import { AGENTS_DIR, CURRENT_IMAGE, LAUNCHER, YEET_HOME, tryLock } from "./host";
 import * as store from "./agent";
 import {
-  runIteration, runChat, runCoverage, firstPrompt, retryPrompt, DEFAULT_LIMITS,
+  runIteration, runChat, runCoverage, firstPrompt, buildPrompt, retryPrompt, DEFAULT_LIMITS,
   type IterationIo, type IterationResult,
 } from "./loop";
 import { Ui, C, usd, dur, type Mode } from "./ui";
@@ -87,12 +87,19 @@ function parse(argv: string[]): { rest: string[]; flags: Flags } {
   return { rest, flags };
 }
 
-/** flag > config > built-in default. Applied in one place so the three sources cannot
- *  disagree between the run loop and what gets reported to the user. */
+/**
+ * flag > config > default. Applied in one place so the sources cannot disagree between the run
+ * loop and what gets reported.
+ *
+ * There is deliberately NO built-in spend cap. A cap you did not ask for is a run that stops
+ * for a reason you were never told about, and the number it stopped at was invented by us.
+ * Spending is bounded instead by the things the user can see: the round limit, the stall
+ * detectors, and the two-hour ceiling. `--max-cost` or `yeet config budget` opts in.
+ */
 function resolveLimits(flags: Flags): void {
   const cfg = loadConfig();
   flags.maxIter ??= cfg.maxIterations ?? DEFAULT_LIMITS.maxIterations;
-  flags.maxCost ??= cfg.maxCostUsd ?? DEFAULT_LIMITS.maxCostUsd;
+  flags.maxCost ??= cfg.maxCostUsd ?? null;
 }
 
 function makeUi(flags: Flags): Ui {
@@ -151,7 +158,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
       event: "start",
       agent: agent.name, task: followUp ?? agent.task, resuming: !!followUp, isNew: agent.iterations.length === 0 && !followUp,
       model: agent.model, origin: agent.origin, verify: agent.verify?.command ?? null,
-      maxIter: flags.maxIter!, maxCostUsd: flags.maxCost!,
+      maxIter: flags.maxIter!, maxCostUsd: flags.maxCost,
     });
     if (ui.autoAnswer && ui.mode !== "json" && !process.stdin.isTTY) {
       ui.event({ event: "info", message: "no terminal to ask questions on — taking the agent's recommendations" });
@@ -166,6 +173,10 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
     // Cost is the DELTA per iteration. pi -c appends to one session file, so raw session
     // totals are cumulative — adding them per iteration double-counted every earlier one.
     let prevReading = readSession(findSessionFile(join(dir, "session")));
+    /** Spend during THIS invocation. The cap is per-run, which is what config.ts has always
+     *  documented — measuring from agent.costUsd made it a LIFETIME cap, so an agent that had
+     *  already earned its keep would boot a VM and die in two seconds having spent nothing. */
+    let spentThisRun = 0;
     let strikes = 0;
     /** Fingerprint of the last iteration's failures, for the busy-but-going-nowhere case. */
     let prevSig: string | null = null;
@@ -240,7 +251,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
 
       const r = await runIteration(agent, {
         n: iterN, phase: "agent", runAgent: true, runTest: true, prompt, io,
-        budget: { capUsd: flags.maxCost!, spentBeforeUsd: agent.costUsd },
+        budget: flags.maxCost ? { capUsd: flags.maxCost, spentBeforeUsd: spentThisRun } : undefined,
       });
       history.push(r);
 
@@ -251,6 +262,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
       const delta = costDelta({ file: prevReading.file, costUsd: prevReading.costUsd }, r.session);
       prevReading = r.session;
       agent.costUsd += delta;
+      spentThisRun += delta;
 
       if (!r.valid) {
         const killed = (r.invalidReason ?? "").startsWith("controller killed");
@@ -360,7 +372,7 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
       // Report what ACTUALLY happened, not whichever condition is checked last.
       if (r.stopReason === "budget") {
         outcome = "capped";
-        stopNote = `hit the ${usd(flags.maxCost!)} cap mid-iteration — agent stopped, partial work kept`;
+        stopNote = `hit the ${usd(flags.maxCost ?? 0)} cap mid-iteration — agent stopped, partial work kept`;
         break;
       }
       if (r.stopReason === "stall") {
@@ -461,6 +473,131 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
   }
 }
 
+/**
+ * `yeet "<task>"` — build, once, without testing anything.
+ *
+ * This is the ordinary path, and it is deliberately not a loop. Verifying every prompt made the
+ * cheap thing expensive: most instructions are "now add a flag" or "rename that", and paying for
+ * a baseline run, a confirm run in a second VM, coverage, and the whole gate suite to prove a
+ * rename is overkill you cannot opt out of. So prompting builds, and nothing else.
+ *
+ * `yeet --name <n> verify` is where the loop lives — write or extend the tests, then iterate
+ * until they pass. Splitting them this way also removes a trap: a follow-up used to inherit the
+ * PREVIOUS task's verify command, so "now add CSV export" was graded by the word-count tests and
+ * reported green. Nothing implicit means nothing stale to inherit.
+ *
+ * The cost is real and worth stating: an agent can break its own passing tests here and yeet
+ * will not notice until you run `verify`, `test` or `run`. That is the trade — speed by default,
+ * proof on request.
+ */
+async function runBuild(agent: store.Agent, flags: Flags, ui: Ui, followUp?: string): Promise<number> {
+  const dir = store.agentDir(agent.name);
+  const lock = tryLock(`${dir}/.lock`);
+  if (!lock) {
+    ui.event({ event: "error", message: `agent "${agent.name}" is already running` });
+    return EXIT.usage;
+  }
+
+  try {
+    ui.event({
+      event: "start",
+      agent: agent.name, task: followUp ?? agent.task, resuming: !!followUp,
+      isNew: agent.iterations.length === 0 && !followUp,
+      model: agent.model, origin: agent.origin, verify: agent.verify?.command ?? null,
+      maxIter: 1, maxCostUsd: flags.maxCost,
+    });
+    if (ui.autoAnswer && ui.mode !== "json" && !process.stdin.isTTY) {
+      ui.event({ event: "info", message: "no terminal to ask questions on — taking the agent's recommendations" });
+    }
+    if (followUp) record(agent.name, { kind: "prompt", from: "user", text: followUp });
+
+    agent.state = "running";
+    store.save(agent);
+    record(agent.name, { kind: "status", status: "running", reason: "build" });
+
+    const before = readSession(findSessionFile(join(dir, "session")));
+    const n = agent.iterations.length + 1;
+    const r = await runIteration(agent, {
+      n, phase: "agent", runAgent: true, runTest: false,
+      prompt: buildPrompt(agent, `iter-${String(n).padStart(3, "0")}`, followUp),
+      io: ioFor(ui),
+      budget: flags.maxCost ? { capUsd: flags.maxCost, spentBeforeUsd: 0 } : undefined,
+    });
+
+    // Charge before checking validity: a killed iteration still burned tokens, and the session
+    // file is cumulative, so a skipped charge can never be recovered.
+    const delta = costDelta({ file: before.file, costUsd: before.costUsd }, r.session);
+    agent.costUsd += delta;
+
+    if (!r.valid) {
+      agent.state = "failed";
+      store.save(agent);
+      record(agent.name, { kind: "status", status: "failed", reason: r.invalidReason ?? "infrastructure failure" });
+      ui.event({ event: "error", message: r.invalidReason ?? "infrastructure failure" });
+      return EXIT.failed;
+    }
+
+    agent.iterations.push({
+      n, phase: "agent", agentSeconds: r.agentSeconds, costUsd: delta,
+      insertions: r.insertions, deletions: r.deletions, filesChanged: r.filesChanged,
+      treeChanged: r.treeChanged, testExit: null, verdict: "none",
+      stopReason: r.stopReason ?? undefined,
+    });
+    // "unverified" is the honest state — something was built and nothing proves it works. It is
+    // now the ordinary outcome of prompting rather than a warning, so this path reports its own
+    // ending instead of borrowing the alarmed run-end line the verify path uses.
+    agent.state = "unverified";
+    store.save(agent);
+    record(agent.name, {
+      kind: "iteration", n,
+      agent: {
+        seconds: r.agentSeconds, costUsd: delta,
+        outcome: r.agentVerdict ?? "no_edit", stoppedBy: r.stopReason, sessionEnd: r.session.turns,
+      },
+      git: {
+        commit: r.committed ? r.afterHead : null, treeChanged: r.treeChanged,
+        filesChanged: r.filesChanged, linesAdded: r.insertions, linesRemoved: r.deletions,
+        protectedTestsChanged: r.touchedFrozen,
+      },
+      verify: null,
+    });
+    record(agent.name, { kind: "status", status: "unverified", reason: "built without verification" });
+
+    if (ui.mode === "json") {
+      console.log(JSON.stringify({
+        event: "done", agent: agent.name, state: "unverified", branch: agent.branch,
+        costUsd: delta, filesChanged: r.filesChanged, insertions: r.insertions, deletions: r.deletions,
+        committed: r.committed, tested: false,
+      }));
+      return 0;
+    }
+
+    const summary = lastSummary(agent);
+    console.log("");
+    if (!r.treeChanged) {
+      console.log(C.yellow("It didn't change anything."));
+    } else {
+      console.log(`${C.green("Built.")} ${C.dim(`${r.filesChanged} file${r.filesChanged === 1 ? "" : "s"}, +${r.insertions} −${r.deletions}, ${plebMoney(delta)}`)}`);
+    }
+    if (summary) {
+      console.log("");
+      console.log(`  ${plainText(summary, 400)}`);
+    }
+    const steps: Array<[string, string]> = [
+      [`yeet --name ${agent.name} "…"`, "keep going"],
+      [`yeet --name ${agent.name} run`, "run it and see"],
+      [`yeet --name ${agent.name} verify`, "write tests and prove it works"],
+    ];
+    const w = Math.max(...steps.map(([c]) => c.length)) + 3;
+    console.log("");
+    console.log(C.dim("next"));
+    for (const [cmd, why] of steps) console.log(`  ${cmd.padEnd(w)}${C.dim(why)}`);
+    return 0;
+  } finally {
+    lock.release();
+  }
+}
+
 // ── commands ──────────────────────────────────────────────────────────────────────────────
 
 function cmdLs(ui: Ui): number {
@@ -484,10 +621,21 @@ function cmdLs(ui: Ui): number {
   const w = Math.max(24, ...agents.map((a) => a.name.length + 2));
   console.log(C.dim("NAME".padEnd(w) + "STATUS".padEnd(10) + "COST".padEnd(10) + "CHANGES"));
   for (const a of agents) {
-    // Six internal states, two words a person cares about: did it work or not. "running" stays
-    // its own word — calling a live agent "failed" would just be untrue.
-    const status = a.state === "passed" ? "good" : a.state === "running" ? "running" : "failed";
-    const paint = status === "good" ? C.green : status === "running" ? C.cyan : C.red;
+    // "unverified" is now the ordinary outcome of prompting, since tests only run when asked,
+    // so it gets its own word. Rendering it as red "failed" was defensible while verification
+    // was mandatory and is simply untrue now: nothing failed, nothing was checked.
+    const status =
+      a.state === "passed" ? "good"
+      : a.state === "running" ? "running"
+      : a.state === "unverified" ? "built"
+      : a.state === "capped" || a.state === "stalled" ? "stopped"
+      : "failed";
+    const paint =
+      status === "good" ? C.green
+      : status === "running" ? C.cyan
+      : status === "built" ? C.dim
+      : status === "stopped" ? C.yellow
+      : C.red;
     const last = a.iterations.at(-1);
     const changes = last ? `${C.green(`+${last.insertions}`)} ${C.red(`−${last.deletions}`)}` : C.dim("—");
     // Pad the PLAIN text, then colour it. padEnd() counts ANSI escape bytes as width, so
@@ -508,8 +656,10 @@ function cmdLs(ui: Ui): number {
  * one conflicting line and still break each other — the failure a textual merge cannot see, and
  * the only reason a VM belongs in this path at all.
  */
-async function cmdMerge(agent: store.Agent, flags: Flags, ui: Ui): Promise<number> {
-  const target = loadConfig().target ?? "main";
+async function cmdMerge(agent: store.Agent, flags: Flags, ui: Ui, targetArg?: string): Promise<number> {
+  // Argument first: `yeet --name x merge master` is what someone reaches for, and until now
+  // the only way to change it was hand-editing a config file nobody had been told about.
+  const target = targetArg ?? loadConfig().target ?? "main";
   const lock = tryLock(`${store.agentDir(agent.name)}/.lock`);
   if (!lock) { ui.event({ event: "error", message: `${agent.name} is busy right now` }); return EXIT.usage; }
 
@@ -597,6 +747,71 @@ async function cmdMerge(agent: store.Agent, flags: Flags, ui: Ui): Promise<numbe
  * an agent, not a filesystem: they should never need to know there is a git repo, where it is,
  * or which package manager it chose. yeet knows the verify command; yeet runs it.
  */
+/**
+ * `yeet --name <n> run` — check it still works, then tell you how to use it.
+ *
+ * Tests first when they exist, because "run it" is the moment you are about to trust the thing,
+ * and that is exactly when a silent regression from the fast build path should surface. When no
+ * tests exist it says so plainly rather than implying it checked.
+ *
+ * It does not execute the app for you. The workspace is a git directory on the host and the
+ * thing may want a terminal, a port, or arguments; the agent's own summary carries the command,
+ * so the honest move is to hand it over rather than guess at an invocation.
+ */
+async function cmdRun(agent: store.Agent, ui: Ui): Promise<number> {
+  let passed: boolean | null = null;
+
+  if (agent.verify) {
+    const lock = tryLock(`${store.agentDir(agent.name)}/.lock`);
+    if (!lock) {
+      ui.event({ event: "error", message: `${agent.name} is busy right now` });
+      return EXIT.usage;
+    }
+    try {
+      if (ui.mode !== "json") console.log(C.dim("checking it still works…"));
+      const r = await runIteration(agent, {
+        n: 0, phase: "confirm", runAgent: false, runTest: true, dirName: "manual-run",
+      });
+      if (!r.valid) {
+        ui.event({ event: "error", message: r.invalidReason ?? "the sandbox did not come back" });
+        return EXIT.failed;
+      }
+      passed = r.verdict === "green";
+      record(agent.name, {
+        kind: "verify_run", reason: "manual", command: agent.verify.command,
+        exitCode: r.testExit ?? -1, passed,
+      });
+      if (!passed && ui.mode !== "json") {
+        console.log("");
+        console.log(C.red("Its own tests are failing."));
+        for (const line of r.testLog.split("\n").slice(-12)) console.log(C.dim(`  ${line}`));
+      }
+    } finally {
+      lock.release();
+    }
+  }
+
+  const summary = lastSummary(agent);
+  if (ui.mode === "json") {
+    console.log(JSON.stringify({ event: "run", agent: agent.name, tested: passed !== null, passed, summary }));
+    return passed === false ? EXIT.failed : 0;
+  }
+
+  console.log("");
+  if (passed === true) console.log(C.green("Tests pass. Here's how to run it:"));
+  else if (passed === null) console.log(C.yellow("Nothing tests this yet, so I can't promise it works. Here's how to run it:"));
+  else console.log(C.yellow("Running it anyway is up to you. Here's how:"));
+  console.log("");
+  console.log(`  ${summary ? plainText(summary, 400) : C.dim("it never left a summary — try yeet ask --name " + agent.name)}`);
+  console.log("");
+  console.log(C.dim("  workspace: ") + store.workspaceDir(agent.name));
+  if (passed === null) {
+    console.log("");
+    console.log(C.dim(`  yeet --name ${agent.name} verify   write tests and prove it works`));
+  }
+  return passed === false ? EXIT.failed : 0;
+}
+
 async function cmdTest(name: string, ui: Ui): Promise<number> {
   if (!store.exists(name)) {
     ui.event({ event: "error", message: `no agent named "${name}" — see yeet ls` });
@@ -1164,14 +1379,16 @@ run this.
     return;
   }
 
-  console.log(`yeet — sandboxed coding agents that loop until the work actually checks out
+  console.log(`yeet — coding agents in throwaway sandboxes. Build fast, prove it when you want.
 
-  yeet "build me a thing"        start a new agent. It asks questions first, proves its
-                                 work with tests, and never touches your files.
-  yeet --name <n> "now do this"  give that agent more work
-  yeet --name <n> test           run its checks and show you the output
+  yeet "build me a thing"        start a new agent. It asks questions first and never
+                                 touches your files. Builds; does not test.
+  yeet --name <n> "now do this"  give that agent more work. Also does not test.
+  yeet --name <n> run            check it still works, and how to run it
+  yeet --name <n> verify         write tests and keep going until they pass
+  yeet --name <n> test           run the tests it has, show you the output
   yeet --name <n> push           push its branch to origin (asks first)
-  yeet --name <n> merge          combine its work with your main branch
+  yeet --name <n> merge [branch] combine its work with your main branch
 
   yeet ls                        every agent and how it went
   yeet ask "which one did X?"    find the agent you mean. Free.
@@ -1182,7 +1399,7 @@ run this.
   --name <n>       which agent. Starting a new one, this names it.
   --rename <new>   yeet --name <old> --rename <new>
   --model <p/m>    ${model}
-  --max-cost USD   ${cost}          --max-iter N   ${iter}
+  --max-cost USD   ${cost}   --max-iter N   ${iter}
   --smarty         the trace: tool calls, exit codes, tokens, latency
   --yes            don't wait for answers — take the agent's recommendations
   --agent          machine mode: JSON lines on stdout, nothing else
@@ -1300,8 +1517,12 @@ async function main(): Promise<number> {
     // words in a task, which is exactly the ambiguity that killed the positional name.
     if (rest.length === 1 && rest[0] === "test") return cmdTest(agent.name, ui);
     if (rest.length === 1 && rest[0] === "push") return cmdPush(agent, ui);
-    if (rest.length === 1 && rest[0] === "merge") return cmdMerge(agent, flags, ui);
-    if (rest.length) return runAgentLoop(agent, flags, ui, rest.join(" "));
+    if (rest[0] === "merge") return cmdMerge(agent, flags, ui, rest[1]);
+    if (rest.length === 1 && rest[0] === "run") return cmdRun(agent, ui);
+    // `verify` is the loop: write or extend the tests, then iterate until they pass. Everything
+    // else that arrives with a --name is an instruction, and instructions just build.
+    if (rest.length === 1 && rest[0] === "verify") return runAgentLoop(agent, flags, ui);
+    if (rest.length) return runBuild(agent, flags, ui, rest.join(" "));
 
     ui.event({
       event: "error",
@@ -1310,7 +1531,7 @@ async function main(): Promise<number> {
     return EXIT.usage;
   }
 
-  if (rest.length === 1 && (rest[0] === "test" || rest[0] === "push" || rest[0] === "merge")) {
+  if (rest.length === 1 && ["test", "push", "merge", "run", "verify"].includes(rest[0]!)) {
     ui.event({ event: "error", message: `which agent? yeet --name <n> ${rest[0]} — see yeet ls` });
     return EXIT.usage;
   }
@@ -1347,7 +1568,7 @@ async function main(): Promise<number> {
         : { event: "info", message: r.detail },
     );
   }
-  return runAgentLoop(agent, flags, ui);
+  return runBuild(agent, flags, ui);
 }
 
 process.exitCode = await main();

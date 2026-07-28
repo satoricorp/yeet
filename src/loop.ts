@@ -373,6 +373,38 @@ function commitMessage(agent: store.Agent, n: number): string {
  *  (voice.ts), not to the prompt of the thing writing code — with ONE scoped exception: how
  *  ask_user questions may open when the task itself is off. That is where "you sure you want
  *  me to make this?" comes from, and it is the only personality the worker is permitted. */
+/**
+ * The prompt for a plain build — `yeet "<task>"` and every follow-up.
+ *
+ * Deliberately says nothing about tests. Nothing will run them on this path, and instructing an
+ * agent to register verification that is then never used is how the follow-up trap worked: the
+ * command got bound, inherited by the next task, and its stale green reported as a pass.
+ *
+ * `verifyPrompt` (used by `yeet verify`) is where testing is asked for, in detail, at the moment
+ * it is actually going to happen.
+ */
+export function buildPrompt(agent: store.Agent, dirName: string, task?: string): string {
+  const lines = [
+    task ?? agent.task,
+    "",
+    `You are in /yeet/workspace, a git repository on branch ${agent.branch}.`,
+    "",
+    "Before you build: if the task is ambiguous or a real decision has more than one defensible",
+    "answer, use the ask_user tool first. Ask at most a few sharp questions, always with options",
+    "and a recommended answer. If the task is vague or plain silly, you may open your question",
+    "with one dry line — then get to work. Do not ask about things you can decide yourself.",
+    "",
+    "Build the thing and make sure it actually runs. You are not being asked to write a test",
+    "suite right now, and nothing will run one after you finish — so do not spend the user's",
+    "time on scaffolding they did not ask for. If tests already exist, keep them working.",
+    "",
+    `Before you finish, write /yeet/${dirName}/summary.md: 2-4 plain sentences saying what the`,
+    "thing does and the exact command to run it. No jargon, no markdown headings. Someone who",
+    "does not read code should be able to use it from that alone.",
+  ];
+  return lines.join("\n");
+}
+
 export function firstPrompt(agent: store.Agent, dirName: string): string {
   const lines = [
     agent.task,
