@@ -10,7 +10,8 @@
  *
  *   bun test/search.ts
  */
-import { rank, searchLines, ago, type SearchDoc } from "../src/search";
+import { rank, ago, type SearchDoc } from "../src/search";
+import { lines } from "../src/voice";
 
 let failures = 0;
 const check = (label: string, ok: boolean, detail = "") => {
@@ -165,15 +166,15 @@ console.log("\n\x1b[36m▪\x1b[0m the voice may shrug, the facts may not");
   // So the count of agents searched has to survive every voice, including the one telling jokes.
   const VOICES = ["default", "professional", "dad-jokes"];
   for (const v of VOICES) {
-    const L = searchLines(v);
+    const L = lines(v as any).search;
     check(`${v}: says how many were searched when nothing matched`, L.nothing(16).includes("16"));
     check(`${v}: says how many were searched in the footer`, L.footer(16).includes("16"));
     check(`${v}: every line is non-empty`,
       [L.found(2, 16), L.sourceNote, L.nothing(16), L.footer(16)].every((s) => s.trim().length > 0));
   }
-  check("an unknown voice falls back rather than throwing", searchLines("nonsense").footer(3).includes("3"));
+  check("an unknown voice falls back rather than throwing", lines("nonsense" as any).search.footer(3).includes("3"));
   check("the footer always says nothing was woken",
-    VOICES.every((v) => /nothing|no sandbox|nobody/i.test(searchLines(v).footer(16))));
+    VOICES.every((v) => /nothing|no sandbox|nobody/i.test(lines(v as any).search.footer(16))));
 }
 
 console.log("\n\x1b[36m▪\x1b[0m relative time");

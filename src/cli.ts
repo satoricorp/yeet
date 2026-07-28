@@ -38,7 +38,7 @@ import { record } from "./events";
 import { checkCounts, checkCheats, implementationFiles, failureSignature } from "./gates";
 import { reviewWorkspace } from "./review";
 import { analyze, apply, publish } from "./merge";
-import { search, searchLines, lastActive, ago } from "./search";
+import { search, lastActive, ago } from "./search";
 import { readTrace } from "./trace";
 import { renderTrace, renderSearchSmarty, LiveTrace } from "./smarty";
 
@@ -683,7 +683,7 @@ function cmdFind(question: string | undefined, ui: Ui): number {
   }
   if (!hits.length) {
     console.log("");
-    console.log(searchLines(loadConfig().voice).nothing(agents.length));
+    console.log(lines(loadConfig().voice).search.nothing(agents.length));
     console.log("");
     console.log(C.dim("next"));
     console.log(`  yeet ls                  ${C.dim("every agent you have")}`);
@@ -707,7 +707,7 @@ function cmdFind(question: string | undefined, ui: Ui): number {
     return 0;
   }
 
-  const vox = searchLines(loadConfig().voice);
+  const vox = lines(loadConfig().voice).search;
   const byName = new Map(agents.map((a) => [a.name, a]));
   const now = Date.now();
   // Pad the PLAIN name before colouring — padEnd counts ANSI escape bytes as width, so bolding

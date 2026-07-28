@@ -97,9 +97,9 @@ Committed to the bit. The rules that keep it from becoming noise:
 
 ## Where the voice lives
 
-- `src/voice.ts` — every canned line yeet itself prints (pleb mode).
-- `src/search.ts` — the lines for cross-agent search. They belong in `voice.ts` and should move
-  there; they were put in `search.ts` to avoid depending on then-uncommitted code.
+- `src/voice.ts` — every canned line yeet itself prints (pleb mode), including the cross-agent
+  search block under `search`. One table per voice, so adding a line means writing it three
+  times and noticing if one of them says something different.
 - The agent's `ask_user` questions — via ONE scoped sentence in the build prompt: if the task is
   vague or silly, the question may open with one dry line. That is where the "vague" and "silly"
   examples above surface in practice.

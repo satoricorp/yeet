@@ -230,59 +230,6 @@ function bestSnippet(text: string, terms: Set<string>, max = 160): string | null
   return clean.length > max ? clean.slice(0, max).replace(/\s+\S*$/, "") + "…" : clean;
 }
 
-/**
- * What yeet says about a search.
- *
- * These belong in src/voice.ts with every other canned line, and should move there once the
- * three-voice refactor is committed — today `lines()` exists only in an uncommitted working
- * tree, and importing it from here would make search depend on code that is not in the
- * repository. That is precisely the defect that left HEAD unable to start, so it is not a
- * mistake worth making twice.
- *
- * The house rule holds regardless of where they live: all three voices report the SAME facts.
- * Tone may shrug; the count may not change.
- */
-export type SearchLines = {
-  /** The opener. `n` strong hits out of `scanned` agents. */
-  found: (n: number, scanned: number) => string;
-  /** Why these descriptions can be trusted, and what they are not: nobody was asked. */
-  sourceNote: string;
-  /** Searched everything, nothing was about that. */
-  nothing: (scanned: number) => string;
-  /** The closing reassurance: this cost nothing and woke nothing. */
-  footer: (scanned: number) => string;
-};
-
-const SEARCH_LINES: Record<string, SearchLines> = {
-  default: {
-    found: (n) =>
-      n === 1 ? "Just the one." :
-      n === 2 ? "Two of them, and they both have a claim to it." :
-      `${n} of them look right.`,
-    sourceNote: "I didn't ask anyone — this is what they wrote down.",
-    nothing: (scanned) => `Nothing. I read all ${scanned} of them and none are about that.`,
-    footer: (scanned) => `${scanned} agents, read straight off your disk. Nothing woke up.`,
-  },
-  professional: {
-    found: (n) => (n === 1 ? "1 matching agent." : `${n} matching agents.`),
-    sourceNote: "Matched against stored summaries. No agent was queried.",
-    nothing: (scanned) => `No matches across ${scanned} agents.`,
-    footer: (scanned) => `${scanned} agents searched locally. No sandbox was started.`,
-  },
-  "dad-jokes": {
-    found: (n) =>
-      n === 1 ? "Just the one. Needle located, haystack intact." :
-      `${n} of them fit. Not a needle in a haystack after all — a needle in an index.`,
-    sourceNote: "I didn't ask them, I just read their notes. Very hands-off. Very re-mote.",
-    nothing: (scanned) =>
-      `Nothing matched. I checked every branch and found nothing but leaves — all ${scanned} of them.`,
-    footer: (scanned) => `${scanned} agents, all read locally. Nobody got booted.`,
-  },
-};
-
-export const searchLines = (voice: string = "default"): SearchLines =>
-  SEARCH_LINES[voice] ?? SEARCH_LINES.default!;
-
 /** Read the corpus off disk and rank it. The only part that touches the store. */
 export function search(query: string, agents: store.Agent[]): Hit[] {
   return rank(query, agents.map((a) => {

@@ -81,6 +81,20 @@ export type Lines = {
    *  run-end lines above — those are written for the moment a run finishes ("we did it!"),
    *  which reads as strange when you are looking something up three days later. */
   state: (state: string, model: string) => string;
+  /** Cross-agent search — `yeet ask "<question>"` with no --name. Grouped rather than flattened
+   *  because these four only ever appear together, on one screen. */
+  search: SearchLines;
+};
+
+export type SearchLines = {
+  /** The opener. `n` strong hits out of `scanned` agents. */
+  found: (n: number, scanned: number) => string;
+  /** Why these descriptions can be trusted, and what they are not: nobody was asked. */
+  sourceNote: string;
+  /** Searched everything, nothing was about that. */
+  nothing: (scanned: number) => string;
+  /** The closing reassurance: this cost nothing and woke nothing. */
+  footer: (scanned: number) => string;
 };
 
 /**
@@ -112,6 +126,15 @@ const VOICE_LINES: Record<Voice, Lines> = {
         default: return state;
       }
     },
+    search: {
+      found: (n) =>
+        n === 1 ? "Just the one." :
+        n === 2 ? "Two of them, and they both have a claim to it." :
+        `${n} of them look right.`,
+      sourceNote: "I didn't ask anyone — this is what they wrote down.",
+      nothing: (scanned) => `Nothing. I read all ${scanned} of them and none are about that.`,
+      footer: (scanned) => `${scanned} agents, read straight off your disk. Nothing woke up.`,
+    },
   },
 
   /** For screen-shares and people who did not sign up for a personality. */
@@ -136,6 +159,12 @@ const VOICE_LINES: Record<Voice, Lines> = {
         default: return state;
       }
     },
+    search: {
+      found: (n) => (n === 1 ? "1 matching agent." : `${n} matching agents.`),
+      sourceNote: "Matched against stored summaries. No agent was queried.",
+      nothing: (scanned) => `No matches across ${scanned} agents.`,
+      footer: (scanned) => `${scanned} agents searched locally. No sandbox was started.`,
+    },
   },
 
   "dad-jokes": {
@@ -159,6 +188,15 @@ const VOICE_LINES: Record<Voice, Lines> = {
         case "failed": return `it fell over. ${blameProvider(model)}'s model — I'd point fingers, but I don't have any.`;
         default: return state;
       }
+    },
+    search: {
+      found: (n) =>
+        n === 1 ? "Just the one. Needle located, haystack intact." :
+        `${n} of them fit. Not a needle in a haystack after all — a needle in an index.`,
+      sourceNote: "I didn't ask them, I just read their notes. Very hands-off. Very re-mote.",
+      nothing: (scanned) =>
+        `Nothing matched. I checked every branch and found nothing but leaves — all ${scanned} of them.`,
+      footer: (scanned) => `${scanned} agents, all read locally. Nobody got booted.`,
     },
   },
 };
