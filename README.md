@@ -13,15 +13,19 @@ actually works.
 
 ## Install
 
-macOS on Apple Silicon.
+macOS on Apple Silicon, with [Homebrew](https://brew.sh) and [Bun](https://bun.sh).
 
 ```bash
+brew tap slp/krun                         # libkrun is not in homebrew-core
 brew install libkrun libkrunfw
 git clone git@github.com:satoricorp/yeet.git && cd yeet
-ln -s "$PWD/bin/yeet" ~/.local/bin/yeet   # or anywhere on your PATH
+ln -s "$PWD/bin/yeet" "$(brew --prefix)/bin/yeet"
 guest/setup.sh                            # builds the guest image — ~5 min, 563 MB
 bun test/roundtrip.ts                     # proves the machine works, no API key needed
 ```
+
+`bun` is not optional — `bin/yeet` execs it. Any directory on your `PATH` works for the symlink;
+Homebrew's is used above only because you have just proven it exists.
 
 Then give it a key. The agent inside the VM is [pi](https://github.com/badlogic/pi-mono), and it
 needs an API-key provider — OpenRouter, OpenAI, Groq, and so on. Anthropic via OAuth cannot be
