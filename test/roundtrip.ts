@@ -14,6 +14,7 @@
  *   bun test/roundtrip.ts
  */
 import { mkdirSync, rmSync, writeFileSync, copyFileSync, existsSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { cloneTree, tryLock, CURRENT_IMAGE, YEET_HOME } from "../src/host";
 import { writeRequest, readMeta, sawDone, num, bool, ContractError, type Phase, type Meta } from "../src/contract";
@@ -22,7 +23,10 @@ import { Bridge, type VerifyDecision } from "../src/bridge";
 import { parseLcov } from "../src/coverage";
 
 const SCRATCH = join(YEET_HOME, "scratch-roundtrip");
-const REPO_ROOT = new URL("..", import.meta.url).pathname;
+// fileURLToPath, not .pathname: a URL pathname is percent-encoded, so a checkout under a
+// directory with a space ("Dev Projects") became ".../Dev%20Projects/..." and every first
+// run died on a raw ENOENT that looked like a broken install.
+const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
 let failures = 0;
 const check = (label: string, ok: boolean, detail = "") => {

@@ -14,6 +14,7 @@
  * cap live, and decides when a silent guest is dead.
  */
 import { copyFileSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { join } from "node:path";
 import { cloneTree, discardTree, CURRENT_IMAGE } from "./host";
 import { writeRequest, readMeta, sawDone, num, bool, type Phase } from "./contract";
@@ -25,7 +26,10 @@ import { record } from "./events";
 import { findLcov, parseLcov, type Coverage } from "./coverage";
 import * as store from "./agent";
 
-const REPO_ROOT = new URL("..", import.meta.url).pathname;
+// fileURLToPath, not .pathname: a URL pathname is percent-encoded, so a checkout under a
+// directory with a space ("Dev Projects") became ".../Dev%20Projects/..." and every first
+// run died on a raw ENOENT that looked like a broken install.
+const REPO_ROOT = fileURLToPath(new URL("..", import.meta.url));
 
 export type Limits = { maxIterations: number; maxCostUsd: number; stallMs: number; hardCeilingMs: number };
 export const DEFAULT_LIMITS: Limits = {
