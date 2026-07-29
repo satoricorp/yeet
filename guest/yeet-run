@@ -168,7 +168,12 @@ if [ "$YEET_RUN_AGENT" = "1" ]; then
   meta agentExit    "$AGENT_EXIT"
   meta agentSeconds "$((A1 - A0))"
 
-  SESSION_FILE=$(find "$YEET_SESSION_DIR" -name '*.jsonl' -type f 2>/dev/null | head -1)
+  # Newest by mtime, matching the HOST's rule in src/session.ts exactly. This used to be
+  # `find | head -1` — directory order, i.e. arbitrary — which agrees with the host only while
+  # exactly one file exists. Two pickers that diverge on the second file means the meta.kv
+  # record and the host's cost accounting can silently describe different sessions.
+  SESSION_FILE=$(find "$YEET_SESSION_DIR" -name '*.jsonl' -type f -printf '%T@ %p\n' 2>/dev/null \
+                 | sort -rn | head -1 | cut -d' ' -f2-)
   meta sessionFile "${SESSION_FILE:-}"
 else
   meta agentRan 0

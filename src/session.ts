@@ -117,14 +117,23 @@ export function agentVerdict(
 /**
  * Incremental cost of one iteration. `pi -c` APPENDS to the same session file (sessions.md:
  * continue -> "Same session file"), so readSession() returns cumulative-for-the-file totals —
- * adding those per iteration double-counts every earlier iteration. Diff against the previous
- * reading of the same file; a new file starts its own base.
+ * adding those per iteration double-counts every earlier iteration. The charge is growth
+ * beyond the baseline reading, whatever file the total now lives in.
+ *
+ * The old cross-file branch returned cur.costUsd — the new file's FULL cumulative total — on
+ * the theory that a new file is a fresh session. That recharges every already-billed turn the
+ * moment anything rotates or replays a session: a rewind that writes a truncated copy would
+ * phantom-bill the entire replayed prefix (+$0.087 on one real agent here, more than the
+ * iteration it accompanied). A genuinely fresh session is not harmed by baselining: its
+ * baseline was read before the first turn landed, so prev.costUsd is zero and it bills in
+ * full. The one case this undercharges is a fresh file that spends more in a single iteration
+ * than the agent's whole prior life — with the baseline swallowed rather than recharged —
+ * which cannot arise from yeet's own flows, where a replaced file always carries its prefix.
  */
 export function costDelta(
   prev: { file: string | null; costUsd: number } | null,
   cur: SessionStats,
 ): number {
   if (!cur.file) return 0;
-  if (prev && prev.file === cur.file) return Math.max(0, cur.costUsd - prev.costUsd);
-  return cur.costUsd;
+  return Math.max(0, cur.costUsd - (prev?.costUsd ?? 0));
 }

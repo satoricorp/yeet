@@ -474,6 +474,53 @@ async function runAgentLoop(agent: store.Agent, flags: Flags, ui: Ui, followUp?:
 }
 
 /**
+ * `yeet --name <n> verify` — prove the work, as cheaply as the truth allows.
+ *
+ * If a suite already exists, run it once in a fresh sandbox: green means the proof stands and
+ * there is nothing to pay an agent for. Only when there is no suite, or the suite is red, does
+ * the full loop start — write or extend the tests, then iterate until they pass.
+ */
+async function cmdVerify(agent: store.Agent, flags: Flags, ui: Ui): Promise<number> {
+  if (agent.verify) {
+    const lock = tryLock(`${store.agentDir(agent.name)}/.lock`);
+    if (!lock) {
+      ui.event({ event: "error", message: `${agent.name} is busy right now` });
+      return EXIT.usage;
+    }
+    let green = false;
+    try {
+      if (ui.mode !== "json") console.log(C.dim("it already has tests — running them first…"));
+      const r = await runIteration(agent, {
+        n: 0, phase: "confirm", runAgent: false, runTest: true, dirName: "manual-test",
+      });
+      if (r.valid) {
+        record(agent.name, {
+          kind: "verify_run", reason: "manual", command: agent.verify.command,
+          exitCode: r.testExit ?? -1, passed: r.verdict === "green",
+        });
+        green = r.verdict === "green";
+        if (green) {
+          agent.state = "passed";
+          store.save(agent);
+          record(agent.name, { kind: "status", status: "passed", reason: "existing suite green" });
+          if (ui.mode === "json") {
+            console.log(JSON.stringify({ event: "verify", agent: agent.name, ran: true, passed: true, looped: false }));
+          } else {
+            console.log("");
+            console.log(`${C.green("Still green.")} ${C.dim("The existing tests pass — nothing to fix, nothing spent.")}`);
+          }
+          return 0;
+        }
+        if (ui.mode !== "json") console.log(C.yellow("the suite is red — starting the loop to fix it"));
+      }
+    } finally {
+      lock.release();
+    }
+  }
+  return runAgentLoop(agent, flags, ui);
+}
+
+/**
  * `yeet "<task>"` — build, once, without testing anything.
  *
  * This is the ordinary path, and it is deliberately not a loop. Verifying every prompt made the
@@ -812,51 +859,6 @@ async function cmdRun(agent: store.Agent, ui: Ui): Promise<number> {
   return passed === false ? EXIT.failed : 0;
 }
 
-async function cmdTest(name: string, ui: Ui): Promise<number> {
-  if (!store.exists(name)) {
-    ui.event({ event: "error", message: `no agent named "${name}" — see yeet ls` });
-    return EXIT.usage;
-  }
-  const agent = store.load(name);
-  if (!agent.verify) {
-    ui.event({ event: "error", message: `${name} never registered a way to check its work, so there is nothing to run` });
-    return EXIT.unverified;
-  }
-
-  const lock = tryLock(`${store.agentDir(name)}/.lock`);
-  if (!lock) {
-    ui.event({ event: "error", message: `${name} is busy right now` });
-    return EXIT.usage;
-  }
-  try {
-    if (ui.mode !== "json") console.log(C.dim(`running its checks in a fresh sandbox…`));
-    const r = await runIteration(agent, {
-      n: 0, phase: "confirm", runAgent: false, runTest: true, dirName: "manual-test",
-    });
-    if (!r.valid) {
-      ui.event({ event: "error", message: r.invalidReason ?? "the sandbox did not come back" });
-      return EXIT.failed;
-    }
-    record(name, {
-      kind: "verify_run", reason: "manual", command: agent.verify.command,
-      exitCode: r.testExit ?? -1, passed: r.verdict === "green",
-    });
-
-    if (ui.mode === "json") {
-      console.log(JSON.stringify({ event: "test", agent: name, exitCode: r.testExit, passed: r.verdict === "green", output: r.testLog }));
-    } else {
-      console.log("");
-      for (const line of r.testLog.trimEnd().split("\n")) console.log(`  ${line}`);
-      console.log("");
-      console.log(r.verdict === "green" ? C.green("  all good.") : C.red(`  that is a fail (exit ${r.testExit}).`));
-      if (r.verdict !== "green") console.log(C.dim(`  tell it to fix them: yeet --name ${name} "the checks are failing"`));
-    }
-    return r.verdict === "green" ? EXIT.passed : EXIT.failed;
-  } finally {
-    lock.release();
-  }
-}
-
 /**
  * yeet ask "<question>" — with no --name, search every agent. Free, local, no VM.
  *
@@ -1018,7 +1020,7 @@ async function cmdAsk(name: string, question: string | undefined, ui: Ui, capUsd
     console.log(`  checked  ${v ? (last?.verdict === "green" ? "tests pass" : "tests are failing") : C.yellow("nothing verifies this")}${agent.coverage ? C.dim(` · ${agent.coverage.pct}% of the code covered`) : ""}`);
 
     const steps: Array<[string, string]> = [
-      [`yeet --name ${agent.name} test`, "run its checks and show the output"],
+      [`yeet --name ${agent.name}`, "run it and see"],
       [`yeet --name ${agent.name} "…"`, "keep building"],
       [`yeet ask --name ${agent.name} "why …?"`, "ask it about its own work (a few cents)"],
     ];
@@ -1090,32 +1092,13 @@ async function cmdRm(name: string, ui: Ui): Promise<number> {
   }
 }
 
-async function cmdPush(agent: store.Agent, ui: Ui): Promise<number> {
-  if (!agent.origin) {
-    ui.event({ event: "error", message: `no origin configured — yeet config --name ${agent.name} origin <url>` });
-    return EXIT.usage;
-  }
-  const ok = await ui.confirm(`Push ${agent.branch} to ${agent.origin}?`);
-  if (!ok) {
-    ui.event({ event: "info", message: "not pushed." });
-    return 0;
-  }
-  const r = store.push(agent);
-  if (ui.mode === "json") {
-    console.log(JSON.stringify({ event: "push", agent: agent.name, ok: r.ok, detail: r.detail }));
-  } else {
-    ui.event(r.ok ? { event: "info", message: r.detail } : { event: "error", message: r.detail });
-  }
-  return r.ok ? 0 : EXIT.failed;
-}
-
 function cmdAgentConfig(agent: store.Agent, args: string[], ui: Ui): number {
   if (args.length === 0) {
     if (ui.mode === "json") {
       console.log(JSON.stringify({ event: "config", agent: agent.name, origin: agent.origin, verify: agent.verify, model: agent.model }));
       return 0;
     }
-    console.log(`${C.dim("origin")}    ${agent.origin ?? `none — set one to enable push: yeet config --name ${agent.name} origin <url>`}`);
+    console.log(`${C.dim("origin")}    ${agent.origin ?? `none — set one to enable merge: yeet config --name ${agent.name} origin <url>`}`);
     console.log(`${C.dim("test")}      ${agent.verify ? `${agent.verify.command} (${agent.verify.source})` : "unset — the agent registers one, or set it yourself"}`);
     console.log(`${C.dim("coverage")}  ${agent.verify?.coverageCommand ?? "unset"}`);
     console.log(`${C.dim("model")}     ${agent.model}`);
@@ -1384,10 +1367,9 @@ run this.
   yeet "build me a thing"        start a new agent. It asks questions first and never
                                  touches your files. Builds; does not test.
   yeet --name <n> "now do this"  give that agent more work. Also does not test.
-  yeet --name <n> run            check it still works, and how to run it
-  yeet --name <n> verify         write tests and keep going until they pass
-  yeet --name <n> test           run the tests it has, show you the output
-  yeet --name <n> push           push its branch to origin (asks first)
+  yeet --name <n>                run it — checks it still works, tells you how to use it
+  yeet --name <n> verify         prove it: runs the tests it has; writes them if it has
+                                 none, and loops until they pass
   yeet --name <n> merge [branch] combine its work with your main branch
 
   yeet ls                        every agent and how it went
@@ -1518,23 +1500,19 @@ async function main(): Promise<number> {
     }
     // Bare, on their own, these are the two verbs. With anything around them they are just
     // words in a task, which is exactly the ambiguity that killed the positional name.
-    if (rest.length === 1 && rest[0] === "test") return cmdTest(agent.name, ui);
-    if (rest.length === 1 && rest[0] === "push") return cmdPush(agent, ui);
     if (rest[0] === "merge") return cmdMerge(agent, flags, ui, rest[1]);
-    if (rest.length === 1 && rest[0] === "run") return cmdRun(agent, ui);
-    // `verify` is the loop: write or extend the tests, then iterate until they pass. Everything
-    // else that arrives with a --name is an instruction, and instructions just build.
-    if (rest.length === 1 && rest[0] === "verify") return runAgentLoop(agent, flags, ui);
+    // `verify` is the proof path. Cheap when proof already exists, the full loop when it
+    // does not. Everything else that arrives with a --name is an instruction, and
+    // instructions just build.
+    if (rest.length === 1 && rest[0] === "verify") return cmdVerify(agent, flags, ui);
     if (rest.length) return runBuild(agent, flags, ui, rest.join(" "));
-
-    ui.event({
-      event: "error",
-      message: `"${agent.name}" exists. Give it work (yeet --name ${agent.name} "<task>"), ask about it (yeet ask --name ${agent.name}), or configure it (yeet config --name ${agent.name}).`,
-    });
-    return EXIT.usage;
+    // A bare `yeet --name <n>` runs the thing: check it still works if anything can, then
+    // hand over the command to use it. The verb-free form is the verb people reach for.
+    // (--rename returned above, so nothing else can reach here.)
+    return cmdRun(agent, ui);
   }
 
-  if (rest.length === 1 && ["test", "push", "merge", "run", "verify"].includes(rest[0]!)) {
+  if (rest.length === 1 && ["merge", "verify"].includes(rest[0]!)) {
     ui.event({ event: "error", message: `which agent? yeet --name <n> ${rest[0]} — see yeet ls` });
     return EXIT.usage;
   }
