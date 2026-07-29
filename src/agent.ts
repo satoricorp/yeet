@@ -88,7 +88,7 @@ export type Agent = {
  * an agent is called "test" — `yeet --name test test` is unambiguous. It just reads terribly,
  * in `yeet ls` most of all, so these stay refused.
  */
-export const RESERVED = new Set(["ls", "help", "ask", "rm", "config", "push", "test", "merge", "run", "verify", "-h", "--help"]);
+export const RESERVED = new Set(["ls", "help", "ask", "rm", "config", "push", "test", "merge", "run", "verify", "sync", "cloud", "-h", "--help"]);
 
 /** Names double as directory names and git branch names, so they get the same cleaning
  *  whether they came from slugify or from --name. */

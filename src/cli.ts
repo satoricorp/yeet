@@ -39,6 +39,7 @@ import { checkCounts, checkCheats, implementationFiles, failureSignature } from 
 import { reviewWorkspace } from "./review";
 import { analyze, apply, publish } from "./merge";
 import { search, lastActive, ago } from "./search";
+import * as cloud from "./cloud";
 import { readTrace } from "./trace";
 import { renderTrace, renderSearchSmarty, LiveTrace } from "./smarty";
 
@@ -643,6 +644,80 @@ async function runBuild(agent: store.Agent, flags: Flags, ui: Ui, followUp?: str
   } finally {
     lock.release();
   }
+}
+
+/**
+ * yeet sync / yeet cloud — the S3 + Fargate pair. Both refuse early with the exact fix when
+ * the aws CLI or the YeetCloud stack is missing, because "deploy infra first" is a setup
+ * step, not an error a stack trace should announce.
+ */
+function cloudReady(ui: Ui): cloud.CloudConfig | null {
+  const notReady = cloud.awsReady();
+  if (notReady) { ui.event({ event: "error", message: notReady }); return null; }
+  const cfg = cloud.loadCloudConfig();
+  if ("error" in cfg) { ui.event({ event: "error", message: cfg.error }); return null; }
+  return cfg;
+}
+
+function cmdSync(agent: store.Agent, direction: "push" | "pull", ui: Ui): number {
+  const cfg = cloudReady(ui);
+  if (!cfg) return EXIT.usage;
+  const r = direction === "push" ? cloud.push(cfg, agent) : cloud.pull(cfg, agent);
+  if (ui.mode === "json") {
+    console.log(JSON.stringify({ event: "sync", agent: agent.name, direction, ok: r.ok, detail: r.detail }));
+    return r.ok ? 0 : EXIT.failed;
+  }
+  if (!r.ok) { ui.event({ event: "error", message: r.detail }); return EXIT.failed; }
+  console.log(`${C.green(direction === "push" ? "Synced up." : "Synced down.")} ${C.dim(r.detail)}`);
+  return 0;
+}
+
+async function cmdCloud(agent: store.Agent, rest: string[], flags: Flags, ui: Ui): Promise<number> {
+  const cfg = cloudReady(ui);
+  if (!cfg) return EXIT.usage;
+
+  if (rest[0] === "stop") {
+    const r = cloud.stop(cfg, agent.name);
+    ui.event(r.ok ? { event: "info", message: r.detail } : { event: "error", message: r.detail });
+    return r.ok ? 0 : EXIT.failed;
+  }
+  if (rest[0] === "status") {
+    const r = cloud.status(cfg, agent.name);
+    if (ui.mode === "json") { console.log(JSON.stringify({ event: "cloud_status", agent: agent.name, ...r })); return r.ok ? 0 : EXIT.failed; }
+    console.log(r.ok ? `  ${r.detail}` : C.red(`  ${r.detail}`));
+    return r.ok ? 0 : EXIT.failed;
+  }
+
+  const task = rest.join(" ").trim();
+  if (!task) {
+    ui.event({ event: "error", message: `what should it do up there? yeet cloud --name ${agent.name} "<task>" · or: stop | status` });
+    return EXIT.usage;
+  }
+
+  // State first, always: the task hydrates from S3, so launching without pushing would run
+  // the agent against whatever the cloud saw last — silently stale is the worst kind.
+  if (ui.mode !== "json") console.log(C.dim("syncing state up first…"));
+  const p = cloud.push(cfg, agent);
+  if (!p.ok) { ui.event({ event: "error", message: `sync failed, not launching: ${p.detail}` }); return EXIT.failed; }
+
+  const r = cloud.launch(cfg, agent, task, flags.model ?? undefined);
+  if (!r.ok) { ui.event({ event: "error", message: r.detail }); return EXIT.failed; }
+  if (ui.mode === "json") {
+    console.log(JSON.stringify({ event: "cloud_launch", agent: agent.name, taskArn: r.taskArn }));
+    return 0;
+  }
+  console.log("");
+  console.log(`${C.green("Launched.")} ${C.dim("It will sync its work back to S3 and shut itself down when done.")}`);
+  console.log("");
+  const steps: Array<[string, string]> = [
+    [`yeet cloud status --name ${agent.name}`, "is it still running?"],
+    [`yeet cloud stop --name ${agent.name}`, "kill it early"],
+    [`yeet sync pull --name ${agent.name}`, "bring the work back here"],
+  ];
+  const w = Math.max(...steps.map(([c]) => c.length)) + 3;
+  console.log(C.dim("next"));
+  for (const [cmd, why] of steps) console.log(`  ${cmd.padEnd(w)}${C.dim(why)}`);
+  return 0;
 }
 
 // ── commands ──────────────────────────────────────────────────────────────────────────────
@@ -1372,6 +1447,8 @@ run this.
                                  none, and loops until they pass
   yeet --name <n> merge [branch] combine its work with your main branch
 
+  yeet sync --name <n>           push its state to the cloud (pull: yeet sync pull)
+  yeet cloud --name <n> "<task>" run it on AWS — syncs up, launches, shuts itself down
   yeet ls                        every agent and how it went
   yeet ask "which one did X?"    find the agent you mean. Free.
   yeet ask --name <n>            what one did, and questions about it
@@ -1500,6 +1577,8 @@ async function main(): Promise<number> {
     }
     // Bare, on their own, these are the two verbs. With anything around them they are just
     // words in a task, which is exactly the ambiguity that killed the positional name.
+    if (rest[0] === "sync") return cmdSync(agent, rest[1] === "pull" ? "pull" : "push", ui);
+    if (rest[0] === "cloud") return cmdCloud(agent, rest.slice(1), flags, ui);
     if (rest[0] === "merge") return cmdMerge(agent, flags, ui, rest[1]);
     // `verify` is the proof path. Cheap when proof already exists, the full loop when it
     // does not. Everything else that arrives with a --name is an instruction, and
@@ -1512,7 +1591,7 @@ async function main(): Promise<number> {
     return cmdRun(agent, ui);
   }
 
-  if (rest.length === 1 && ["merge", "verify"].includes(rest[0]!)) {
+  if (["merge", "verify", "sync", "cloud"].includes(rest[0]!)) {
     ui.event({ event: "error", message: `which agent? yeet --name <n> ${rest[0]} — see yeet ls` });
     return EXIT.usage;
   }
