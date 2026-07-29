@@ -32,6 +32,16 @@ PI_URL="https://github.com/badlogic/pi-mono/releases/download/${PI_VER}/pi-linux
 BUN_URL="https://github.com/oven-sh/bun/releases/latest/download/bun-linux-aarch64.zip"
 NODE_VER="v22.17.0"
 NODE_URL="https://nodejs.org/dist/${NODE_VER}/node-${NODE_VER}-linux-arm64.tar.xz"
+GO_VER="1.23.4"
+GO_URL="https://go.dev/dl/go${GO_VER}.linux-arm64.tar.gz"
+RUST_VER="1.83.0"
+RUST_URL="https://static.rust-lang.org/dist/rust-${RUST_VER}-aarch64-unknown-linux-gnu.tar.xz"
+UV_URL="https://github.com/astral-sh/uv/releases/latest/download/uv-aarch64-unknown-linux-gnu.tar.gz"
+# One list, referenced in the digest below, so editing it forces a rebuild. build-essential
+# is not optional garnish: rust cannot LINK without a system cc, and cgo and node-gyp need it
+# too — a toolchain that compiles but cannot link is worse than none, because the agent only
+# finds out at the end of its first build.
+APT_PKGS="git ca-certificates build-essential python3 python3-pip python3-venv"
 
 LAUNCHER="$YEET_HOME/bin/yeet-vm"
 STAGE="$YEET_HOME/images/.build-$$"
@@ -82,6 +92,32 @@ ln -sf /opt/node/bin/npm "$STAGE/usr/local/bin/npm"
 ln -sf /opt/node/bin/npx "$STAGE/usr/local/bin/npx"
 rm -rf "$tmp"
 
+# Go, Rust, uv — same host-fetch pattern as bun/node, same reasoning: no bootstrap ordering
+# traps, reproducible, offline-able. Python itself comes from apt below (Ubuntu 24.04 ships
+# 3.12); uv is the installer agents actually reach for now, and it is one static binary.
+log "go ${GO_VER} (host-fetched)"
+tmp=$(mktemp -d)
+curl -fsSL "$GO_URL" | tar -xz -C "$tmp"
+cp -R "$tmp/go" "$STAGE/opt/go"
+ln -sf /opt/go/bin/go "$STAGE/usr/local/bin/go"
+ln -sf /opt/go/bin/gofmt "$STAGE/usr/local/bin/gofmt"
+rm -rf "$tmp"
+
+log "rust ${RUST_VER} (host-fetched)"
+tmp=$(mktemp -d)
+curl -fsSL "$RUST_URL" | tar -xJ -C "$tmp"
+# The standalone installer is pure file operations, so it runs fine on the macOS host
+# against the stage dir. --without=rust-docs saves ~600 MB nobody in a VM will read.
+"$tmp/rust-${RUST_VER}-aarch64-unknown-linux-gnu/install.sh"   --destdir="$STAGE" --prefix=/usr/local --disable-ldconfig --without=rust-docs >/dev/null
+rm -rf "$tmp"
+
+log "uv (host-fetched)"
+tmp=$(mktemp -d)
+curl -fsSL "$UV_URL" | tar -xz -C "$tmp" --strip-components=1
+install -m 0755 "$tmp/uv" "$STAGE/usr/local/bin/uv"
+install -m 0755 "$tmp/uvx" "$STAGE/usr/local/bin/uvx" 2>/dev/null || true
+rm -rf "$tmp"
+
 # ── guest config ────────────────────────────────────────────────────────────────────────
 log "dns, git identity, mountpoints, init"
 printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$STAGE/etc/resolv.conf"
@@ -128,12 +164,13 @@ chmod +x "$STAGE/usr/local/bin/yeet-init"
 # apt needs its sandbox user disabled on a minimal rootfs, and the base image ships no
 # signed lists, hence AllowUnauthenticated. ca-certificates matters beyond apt: without it
 # node/bun cannot make HTTPS calls, so `npm install` during a project's tests would fail.
-log "installing git + ca-certificates inside the VM"
+log "installing ${APT_PKGS} inside the VM"
 "$LAUNCHER" --root "$STAGE" -- /usr/bin/apt-get \
   -o APT::Sandbox::User=root -o Acquire::AllowInsecureRepositories=true update >/dev/null 2>&1
+# shellcheck disable=SC2086 — the list is deliberately word-split
 "$LAUNCHER" --root "$STAGE" -- /usr/bin/apt-get \
   -o APT::Sandbox::User=root -o APT::Get::AllowUnauthenticated=true \
-  install -y --no-install-recommends git ca-certificates >/dev/null 2>&1
+  install -y --no-install-recommends $APT_PKGS >/dev/null 2>&1
 
 log "warming pi's model catalog inside the VM"
 "$LAUNCHER" --root "$STAGE" -- /usr/local/bin/pi update --models >/dev/null 2>&1 || true
@@ -154,7 +191,7 @@ log "image ${before}MB → ${after}MB"
 log "verifying toolchain in-guest"
 cat > "$STAGE/usr/local/bin/yeet-probe" <<'PROBE'
 #!/bin/bash
-for b in git bun node npm pi; do
+for b in git bun node npm pi python3 pip3 uv go gofmt cargo rustc cc; do
   if command -v "$b" >/dev/null 2>&1; then echo "$b ok"; else echo "$b MISSING"; fi
 done
 PROBE
@@ -168,16 +205,20 @@ if [ -z "$probe" ] || echo "$probe" | grep -q MISSING; then
 fi
 
 # ── publish ─────────────────────────────────────────────────────────────────────────────
-digest=$(printf '%s' "$UBUNTU_URL$PI_URL$BUN_URL$NODE_URL" | shasum -a 256 | cut -c1-12)
+digest=$(printf '%s' "$UBUNTU_URL$PI_URL$BUN_URL$NODE_URL$GO_URL$RUST_URL$UV_URL$APT_PKGS" | shasum -a 256 | cut -c1-12)
 dest="$YEET_HOME/images/base-$digest"
 rm -rf "$dest"
 mv "$STAGE" "$dest"
 cat > "$dest/.yeet-image.json" <<META
-{"digest":"$digest","builtAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","ubuntu":"24.04","pi":"$PI_VER","node":"$NODE_VER","sizeMb":$after}
+{"digest":"$digest","builtAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","ubuntu":"24.04","pi":"$PI_VER","node":"$NODE_VER","go":"$GO_VER","rust":"$RUST_VER","sizeMb":$after}
 META
 
 ln -sfn "$dest" "$YEET_HOME/images/current.tmp"
-mv -f "$YEET_HOME/images/current.tmp" "$YEET_HOME/images/current"
+# -h is load-bearing: without it, BSD mv follows a symlink-to-directory DESTINATION and moves
+# the tmp link INSIDE the old image instead of replacing the link. Latent on every fresh
+# install (no `current` yet) and guaranteed on the first rebuild — which is exactly how it
+# was found: a 2.4 GB image built, verified, published, and then never became current.
+mv -fh "$YEET_HOME/images/current.tmp" "$YEET_HOME/images/current"
 touch "$YEET_HOME/.metadata_never_index"   # keep Spotlight off a Linux rootfs
 
 log "image ready: $dest"
